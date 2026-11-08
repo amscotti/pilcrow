@@ -1,0 +1,23 @@
+[package]
+name = "pilcrow-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPUI editor surface for Pilcrow"
+
+[dependencies]
+gpui = { workspace = true }
+pilcrow-commands = { workspace = true }
+pilcrow-core = { workspace = true }
+pilcrow-ui = { workspace = true }
+unicode-segmentation = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSSpellChecker"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDictionary", "NSRange", "NSString", "NSTextCheckingResult"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+

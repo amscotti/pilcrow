@@ -1,0 +1,59 @@
+[package]
+name = "pilcrow-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pilcrow: a local-first writing app"
+
+[features]
+# Test-only local control socket; never enabled in release artifacts.
+test-driver = []
+# Golden screenshot runner (macOS, manual gate); never in release artifacts.
+goldens = ["dep:image", "gpui/test-support", "gpui_platform/test-support"]
+
+[lib]
+name = "pilcrow_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pilcrow"
+path = "src/main.rs"
+
+[[bin]]
+name = "pilcrow-goldens"
+path = "src/bin/pilcrow-goldens.rs"
+required-features = ["goldens"]
+
+[dependencies]
+gpui = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+pilcrow-commands = { workspace = true }
+pilcrow-core = { workspace = true }
+pilcrow-editor = { workspace = true }
+pilcrow-ui = { workspace = true }
+anyhow = { workspace = true }
+async-channel = "2.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = "1"
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSMenu", "NSMenuItem", "NSEvent"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString", "NSProcessInfo"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { workspace = true }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }

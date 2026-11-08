@@ -1,0 +1,94 @@
+name: Nightly
+
+# The long-running checks that are too slow or too environment-dependent for
+# every push: the real-window E2E suite (including crash/recovery and the
+# frame-trace settlement assertions) and the 100k/1M-word counting fixtures.
+# Signing stays off; nothing here needs a secret.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+env:
+  PILCROW_SIGN: "0"
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  e2e-linux:
+    name: nightly E2E (Linux X11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev \
+            libvulkan-dev
+
+      - name: Set up X11 + AT-SPI
+        uses: xa11y/setup-a11y@v1
+        with:
+          setup-display: true
+          setup-atspi: true
+          setup-window-manager: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-nightly-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build driver binary
+        run: cargo build -p pilcrow-app --features test-driver --locked
+
+      - name: Install E2E test dependencies
+        run: python3 -m pip install --user pytest pytest-xa11y
+
+      - name: Run real-window E2E, crash recovery, trace, and accessibility
+        env:
+          PILCROW_E2E_BIN: target/debug/pilcrow
+          PILCROW_E2E_REQUIRE: "1"
+          PILCROW_E2E_A11Y: "1"
+        run: python3 -m pytest tests/e2e -q -ra
+
+  perf:
+    name: nightly long-note fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev \
+            libvulkan-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-nightly-perf-${{ hashFiles('Cargo.lock') }}
+
+      - name: Counting perf fixtures
+        run: |
+          for filter in \
+            million_word \
+            long_note \
+            hundred_thousand_word \
+            dirty_tracking_stays_exact_on_a_long_note \
+            spellcheck_walks_a_long_note
+          do
+            cargo test --workspace --locked "$filter"
+          done

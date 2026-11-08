@@ -1,0 +1,10 @@
+[package]
+name = "pilcrow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pilcrow document model: bytes, blocks, layout, history"
+
+[dependencies]
+unicode-segmentation = { workspace = true }

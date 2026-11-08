@@ -1,0 +1,161 @@
+name: Release
+
+# Unsigned local-first builds. No codesign, notarization, keychain or signing
+# secrets are used. See docs/RELEASE.md.
+#
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PILCROW_SIGN: "0"
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-${{ hashFiles('Cargo.lock') }}
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Build and bundle
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          export PILCROW_PROFILE=release
+          version="${TAG#v}"
+          export PILCROW_VERSION="$version"
+          scripts/bundle-macos.sh
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/release/Pilcrow.app \
+            "dist/Pilcrow-${TAG}-macos-arm64.app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev \
+            libvulkan-dev
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-${{ hashFiles('Cargo.lock') }}
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Build and package
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          cargo build -p pilcrow-app --release --locked
+          mkdir -p dist
+          stage="dist/Pilcrow-${TAG}-linux-x86_64"
+          mkdir -p "$stage"
+          cp target/release/pilcrow "$stage/"
+          cp packaging/linux/dev.pilcrow.Pilcrow.desktop "$stage/"
+          cp macos/icon-1024.png "$stage/dev.pilcrow.Pilcrow.png"
+          tar -C dist -czf "dist/Pilcrow-${TAG}-linux-x86_64.tar.gz" \
+            "Pilcrow-${TAG}-linux-x86_64"
+          rm -rf "$stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 (best effort)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-${{ hashFiles('Cargo.lock') }}
+      - name: Build
+        run: cargo build -p pilcrow-app --release --locked
+      - name: Package
+        shell: pwsh
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/pilcrow.exe -DestinationPath "dist/Pilcrow-$env:TAG-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [macos, linux, windows]
+    if: always() && needs.macos.result == 'success' && needs.linux.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "Pilcrow $TAG" \
+              --generate-notes
+          fi

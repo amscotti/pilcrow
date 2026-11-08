@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pilcrow-e2e"
+version = "0.1.0"
+description = "Real-window end-to-end tests for Pilcrow"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=8.3,<10",
+    "xa11y>=0.15.4,<0.16",
+    "pytest-xa11y>=0.1,<0.2",
+    # Pillow is deliberately absent: screenshots are written by the driver or
+    # decoded from base64, and this first harness does no pixel comparison.
+]
+
+[tool.setuptools]
+py-modules = ["pilcrow"]
+
+[tool.pytest.ini_options]
+minversion = "8.3"
+testpaths = ["."]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+xfail_strict = true
+markers = [
+    "e2e: real-window end-to-end test (needs a GUI session and a test-driver build)",
+    "screenshot: requires the driver's screenshot capability",
+    "input_sim: requires the driver's platform input-simulation capability",
+    "a11y: talks to the platform accessibility API (opt-in locally)",
+]

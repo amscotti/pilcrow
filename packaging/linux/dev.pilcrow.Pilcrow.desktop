@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pilcrow
+Comment=A local-first writing app
+Exec=pilcrow %F
+TryExec=pilcrow
+Icon=dev.pilcrow.Pilcrow
+Terminal=false
+Categories=Office;TextEditor;
+MimeType=text/markdown;text/plain;
+StartupWMClass=dev.pilcrow.Pilcrow

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pilcrow-app",
+    "crates/pilcrow-commands",
+    "crates/pilcrow-core",
+    "crates/pilcrow-editor",
+    "crates/pilcrow-ui",
+]
+default-members = ["crates/pilcrow-app"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/amscotti/pilcrow"
+
+[workspace.dependencies]
+# Pin a known GPUI snapshot. See docs/GPUI-VERSION.md before changing.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "db43f05e398036f08e544c03cbc068216c7a0aaa" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "db43f05e398036f08e544c03cbc068216c7a0aaa" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+unicode-segmentation = "1"
+
+pilcrow-commands = { path = "crates/pilcrow-commands" }
+pilcrow-core = { path = "crates/pilcrow-core" }
+pilcrow-editor = { path = "crates/pilcrow-editor" }
+pilcrow-ui = { path = "crates/pilcrow-ui" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

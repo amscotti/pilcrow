@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Signing is intentionally disabled: no codesign, no notarization, no
+  # keychain prompt. See docs/RELEASE.md.
+  PILCROW_SIGN: "0"
+  CARGO_TERM_COLOR: always
+  # Debug info is not useful for CI artifacts and roughly doubles the
+  # coverage build's disk footprint.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-15
+          - name: linux-x86_64
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev \
+            libvulkan-dev
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-gpui-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Test-driver feature
+        run: |
+          cargo test -p pilcrow-app --features test-driver --locked
+          cargo clippy -p pilcrow-app --all-targets --features test-driver --locked -- -D warnings
+
+      - name: Free normal build artifacts before coverage
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf target/debug target/llvm-cov-target
+          df -h
+
+      - name: Install coverage tool
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage gate
+        if: runner.os == 'Linux'
+        run: ./scripts/coverage.sh
+
+  driver-smoke:
+    name: driver-smoke (Linux X11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libssl-dev libzstd-dev libasound2-dev \
+            libvulkan-dev
+
+      - name: Set up X11 + AT-SPI
+        uses: xa11y/setup-a11y@v1
+        with:
+          setup-display: true
+          setup-atspi: true
+          setup-window-manager: true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-driver-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build driver binary
+        run: cargo build -p pilcrow-app --features test-driver --locked
+
+      - name: Install E2E test dependencies
+        run: python3 -m pip install --user pytest pytest-xa11y
+
+      - name: Run real-window smoke
+        env:
+          PILCROW_E2E_BIN: target/debug/pilcrow
+          PILCROW_E2E_REQUIRE: "1"
+          PILCROW_E2E_A11Y: "1"
+        run: python3 -m pytest tests/e2e -q -ra
+
+  driver-smoke-macos:
+    name: driver-smoke (macOS)
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Record Python path for the TCC client
+        id: python
+        run: echo "path=$(python3 -c 'import sys; print(sys.executable)')" >> "$GITHUB_OUTPUT"
+      - uses: xa11y/setup-a11y@v1
+        with:
+          macos-tcc-client: ${{ steps.python.outputs.path }}
+      - name: Build driver binary
+        run: cargo build -p pilcrow-app --features test-driver --locked
+      - name: Install E2E test dependencies
+        run: python3 -m pip install --user pytest pytest-xa11y
+      - name: Run real-window smoke
+        env:
+          PILCROW_E2E_BIN: target/debug/pilcrow
+          PILCROW_E2E_REQUIRE: "1"
+          PILCROW_E2E_A11Y: "1"
+        run: python3 -m pytest tests/e2e -q -ra
+
+  windows-check:
+    name: windows-check (best effort)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gpui-${{ hashFiles('Cargo.lock') }}
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: Check test-driver feature
+        run: cargo check -p pilcrow-app --all-targets --features test-driver --locked
