@@ -369,49 +369,53 @@ pub(crate) fn wrap_into(
     wrap_into_from(m, text, kinds, style, max_width, hang, true, lines);
 }
 
-/// [`wrap_into`] for a suffix that starts on a continuation line. The first
-/// suffix line already sits under the list/heading hang, so it gets the
-/// continuation width instead of the full column.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn wrap_into_from(
-    m: &dyn Measurer,
-    text: &str,
-    kinds: Option<&[Kind]>,
+struct WrapSpec<'a> {
+    m: &'a dyn Measurer,
+    kinds: Option<&'a [Kind]>,
     style: MeasureStyle,
     max_width: f32,
     hang: f32,
+}
+
+/// Break one source line (no `\n`) into wrapped visual lines.
+fn wrap_segment(
+    spec: &WrapSpec<'_>,
+    text: &str,
+    kinds: Option<&[Kind]>,
     first_line_full: bool,
+    seg_offset: usize,
     lines: &mut Vec<Line>,
 ) {
-    lines.clear();
-    if text.is_empty() {
-        lines.push(Line { start: 0, end: 0 });
-        return;
-    }
-
     let boundaries = Boundaries::new(text);
     let mut start = 0;
     while start < text.len() {
         // Only the first line gets the full width; the rest sit beside the
         // hanging indent.
         let available = if start == 0 && first_line_full {
-            max_width
+            spec.max_width
         } else {
-            max_width - hang
+            spec.max_width - spec.hang
         };
-        let limit = fit(m, text, kinds, style, start, available, &boundaries);
+        let limit = fit(
+            spec.m,
+            text,
+            kinds,
+            spec.style,
+            start,
+            available,
+            &boundaries,
+        );
         if limit >= text.len() {
             lines.push(Line {
-                start,
-                end: text.len(),
+                start: seg_offset + start,
+                end: seg_offset + text.len(),
             });
             break;
         }
 
         // Greedy filling. A soft break exactly at `limit` is the best break
         // the line can have: the prefix fits, and the whitespace itself is
-        // consumed rather than drawn. Missing this used to break
-        // "one two three" at 70pt into three lines instead of two.
+        // consumed rather than drawn.
         let after_limit = boundaries.unit_end(limit);
         let mut cut = limit;
         if is_soft_break(&text[limit..after_limit]) {
@@ -437,7 +441,7 @@ pub(crate) fn wrap_into_from(
         }
 
         let mut shown = cut;
-        // A break at a newline or a space must not leave it at the end of the
+        // A break at whitespace must not leave it at the end of the wrapped
         // line: it belongs to the boundary, not to the text being drawn.
         while shown > start {
             let unit_start = boundaries.prev(shown);
@@ -446,12 +450,11 @@ pub(crate) fn wrap_into_from(
             }
             shown = unit_start;
         }
-        // Leading whitespace that did not fit the column is swallowed with
-        // the break, not drawn as a visual line of its own: a zero-length
-        // line still occupies the page's vertical rhythm while showing
-        // nothing.
         if shown > start {
-            lines.push(Line { start, end: shown });
+            lines.push(Line {
+                start: seg_offset + start,
+                end: seg_offset + shown,
+            });
         }
 
         start = cut;
@@ -462,16 +465,73 @@ pub(crate) fn wrap_into_from(
             }
             start = end;
         }
-        // A line of trailing spaces still has to consume them, or the loop
-        // spins on whitespace at the end of a paragraph.
         if start >= text.len() {
             break;
         }
     }
-    // Every break the loop found was air: the text is nothing but whitespace
-    // the column could not hold. It is still a line of the document — a
-    // whitespace-only code line must keep its height on the page rather than
-    // vanish between its fences.
+}
+
+/// [`wrap_into`] for a suffix that starts on a continuation line. The first
+/// suffix line already sits under the list/heading hang, so it gets the
+/// continuation width instead of the full column.
+///
+/// Explicit newlines (`\n` / `\r\n`) always terminate the current visual line in
+/// the editor so pressing Enter never jumps a line back into the line above it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrap_into_from(
+    m: &dyn Measurer,
+    text: &str,
+    kinds: Option<&[Kind]>,
+    style: MeasureStyle,
+    max_width: f32,
+    hang: f32,
+    first_line_full: bool,
+    lines: &mut Vec<Line>,
+) {
+    lines.clear();
+    if text.is_empty() {
+        lines.push(Line { start: 0, end: 0 });
+        return;
+    }
+
+    let spec = WrapSpec {
+        m,
+        kinds,
+        style,
+        max_width,
+        hang,
+    };
+    let bytes = text.as_bytes();
+    let mut seg_start = 0;
+    loop {
+        let nl = bytes[seg_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|offset| seg_start + offset);
+        let raw_end = nl.unwrap_or(bytes.len());
+        let seg_end = if nl.is_some() && raw_end > seg_start && bytes[raw_end - 1] == b'\r' {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        if seg_end > seg_start {
+            wrap_segment(
+                &spec,
+                &text[seg_start..seg_end],
+                spec.kinds.map(|k| &k[seg_start..seg_end]),
+                first_line_full && seg_start == 0,
+                seg_start,
+                lines,
+            );
+        }
+        let Some(nl_at) = nl else {
+            break;
+        };
+        seg_start = nl_at + 1;
+        if seg_start >= bytes.len() {
+            break;
+        }
+    }
     if lines.is_empty() {
         lines.push(Line { start: 0, end: 0 });
     }
@@ -664,11 +724,10 @@ mod tests {
     }
 
     #[test]
-    fn a_soft_newline_measures_as_a_space_and_can_break() {
+    fn a_newline_always_breaks_onto_a_new_visual_line() {
         let text = "aa\nbb";
         let wide = wrap(&simple(), text, None, BODY, 50.0, 0.0);
-        assert_eq!(wide, [Line { start: 0, end: 5 }]);
-        assert_eq!(width_range(&simple(), text, None, BODY, 0, 5), 50.0);
+        assert_eq!(wide, [Line { start: 0, end: 2 }, Line { start: 3, end: 5 }]);
 
         let narrow = wrap(&simple(), text, None, BODY, 45.0, 0.0);
         assert_eq!(

@@ -170,7 +170,8 @@ flowchart LR
     editor -->|compare| dirty{"dirty?"}
     document --> dirty
     dirty -->|no| clean["clean title"]
-    dirty -->|yes| edited["title — Edited"]
+    dirty -->|yes, untitled/conflict/error| edited["title — Edited"]
+    dirty -->|yes, normal saved edit| quiet["clean title (window_edited = true)"]
     edit["edit"] --> history["History<br/>diff · grouping · byte cap"]
     history -->|undo/redo| buffer
     history --> history_meta["selection restore"]
@@ -179,7 +180,10 @@ flowchart LR
 - Dirty is a content comparison against `NoteDocument.saved_text`, not just a
   revision. Undoing back to the saved text is clean. The buffer's incremental
   per-line content hash answers "changed" without a scan; bytes are compared
-  only to confirm "unchanged", so the comparison stays exact.
+  only to confirm "unchanged", so the comparison stays exact. Saved files keep
+  the visible title/footer free of `— Edited` during quiet autosaved edits while
+  still publishing exact `set_window_edited(dirty)` to the platform window;
+  untitled notes, conflicts, errors, and recovered drafts surface `— Edited`.
 - Undo is app-owned. Each edit records a bounded diff, a group, and selection
   state; formatting and task toggles restore the expected selection on redo.
 - IME commit/cancel is one undo transaction; the preedit lives in the document
@@ -269,16 +273,16 @@ Details that matter:
 ## 6. App data root
 
 ```text
-PilcrowNext/                     (macOS) ~/Library/Application Support/PilcrowNext
-                                 (Linux) ~/.local/share/pilcrow-next
-                                 (Windows) %APPDATA%\PilcrowNext
+Pilcrow/                         (macOS) ~/Library/Application Support/Pilcrow
+                                 (Linux) ~/.local/share/pilcrow
+                                 (Windows) %APPDATA%\Pilcrow
 ├── settings.json                appearance, text scale, measure
 ├── session.json                 last windows: paths, caret, anchor, scroll, modes, frames
 ├── drafts/
 │   └── <draft-id>.md            atomic recovery copy for pathless notes
 ├── backups/
 │   └── <note>-<path-hash>/
-│       └── <timestamp>.md       rolling save history
+│       └── <timestamp>.md       rolling save history (surfaced in Browse Versions)
 └── recovery/                    quit-time last-resort copies
 ```
 

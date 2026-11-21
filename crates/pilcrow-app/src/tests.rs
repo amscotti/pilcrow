@@ -1348,6 +1348,7 @@ fn session_restores_windows_and_view_state(cx: &mut TestAppContext) {
                 scroll: 9.0,
                 reading: true,
                 focus: true,
+                focus_sentence: false,
                 typewriter: false,
                 frame: Some(session::SavedFrame {
                     x: 40.0,
@@ -1450,7 +1451,7 @@ fn copy_as_html_puts_a_standalone_document_on_the_clipboard(cx: &mut TestAppCont
         .expect("clipboard html");
     assert!(html.starts_with("<!doctype html>"));
     assert!(html.contains("<h1>Heading</h1>"));
-    assert!(html.contains("<p>Body with style.</p>"));
+    assert!(html.contains("<p>Body with <em>style</em>.</p>"));
 }
 
 #[gpui::test]
@@ -1612,6 +1613,22 @@ fn open_urls_accept_local_files_and_reject_network_schemes() {
     assert_eq!(
         open_url_path("file://localhost/tmp/local.md"),
         Some(PathBuf::from("/tmp/local.md"))
+    );
+    assert_eq!(
+        open_url_path("/tmp/100% notes.md"),
+        Some(PathBuf::from("/tmp/100% notes.md"))
+    );
+    assert_eq!(
+        open_url_path("/tmp/%C3notes.md"),
+        Some(PathBuf::from("/tmp/%C3notes.md"))
+    );
+    assert_eq!(
+        open_url_path("file:///tmp/100%25%20notes.md"),
+        Some(PathBuf::from("/tmp/100% notes.md"))
+    );
+    assert_eq!(
+        open_url_path("file:///tmp/100%é.md"),
+        Some(PathBuf::from("/tmp/100%é.md"))
     );
 }
 
@@ -2100,4 +2117,360 @@ fn pristine_startup_blank_window_is_closed_when_external_url_opens(cx: &mut Test
     cx.update(|cx| close_startup_untitled_if_pristine(cx, &mut startup_blank));
     assert!(startup_blank.is_none());
     assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+}
+
+#[test]
+fn launch_note_detection_covers_cli_path_and_errors() {
+    let blank = InitialNote {
+        text: String::new(),
+        path: None,
+        identity: None,
+        disk: None,
+        failed_path: None,
+        error: None,
+    };
+    assert!(!has_launch_note(false, &blank));
+    assert!(has_launch_note(true, &blank));
+
+    let with_path = InitialNote {
+        path: Some(PathBuf::from("/tmp/note.md")),
+        ..blank
+    };
+    assert!(has_launch_note(false, &with_path));
+
+    let with_error = InitialNote {
+        text: String::new(),
+        path: None,
+        identity: None,
+        disk: None,
+        failed_path: Some(PathBuf::from("/tmp/unreadable.md")),
+        error: Some("boom".to_owned()),
+    };
+    assert!(has_launch_note(false, &with_error));
+}
+
+#[gpui::test]
+fn recent_menu_labels_disambiguate_duplicate_basenames(cx: &mut TestAppContext) {
+    let dir = TempDir::new();
+    let root = dir.join("data");
+    let first = dir.join("alpha/README.md");
+    let second = dir.join("beta/README.md");
+    let unique = dir.join("unique.md");
+    let labels = cx.update(|cx| {
+        cx.set_global(AppDataRoot(root.clone()));
+        install(cx);
+        remember_recent(cx, &unique);
+        remember_recent(cx, &second);
+        remember_recent(cx, &first);
+        recent_menu_labels(cx)
+    });
+    assert_eq!(
+        labels,
+        vec![
+            ("README.md — alpha".to_owned(), first),
+            ("README.md — beta".to_owned(), second),
+            ("unique.md".to_owned(), unique),
+        ]
+    );
+}
+
+#[gpui::test]
+fn session_restores_sentence_focus_scope(cx: &mut TestAppContext) {
+    use pilcrow_commands::editor_actions::FocusSentence;
+
+    let dir = TempDir::new();
+    let root = dir.join("data");
+    let path = dir.join("sentence.md");
+    file::write_atomic(&path, b"First sentence. Second sentence.").expect("fixture");
+
+    cx.update(|cx| cx.set_global(AppDataRoot(root.clone())));
+    let window = open_window_with_disk(cx, "First sentence. Second sentence.", &path);
+    {
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.dispatch_action(FocusSentence);
+    }
+    cx.update(persist_session);
+
+    let saved = session::load(&root);
+    assert_eq!(saved.windows.len(), 1);
+    assert!(saved.windows[0].focus_sentence);
+
+    let _ = window.update(cx, |_, window, _| window.remove_window());
+    cx.run_until_parked();
+    session::save(&root, &saved).expect("re-seed session from quit");
+    cx.update(|cx| {
+        cx.set_global(AppDataRoot(root.clone()));
+        install(cx);
+        assert_eq!(restore_session(cx), 1);
+    });
+    let restored = cx.read(|cx| cx.windows())[0];
+    let scope = restored
+        .read::<NoteWindow, _, _>(cx, |note, cx| note.read(cx).editor.read(cx).focus_scope())
+        .expect("restored window");
+    assert_eq!(scope, FocusScope::Sentence);
+}
+
+#[gpui::test]
+fn save_as_remembers_recent_and_does_not_leak_source_backups(cx: &mut TestAppContext) {
+    let dir = TempDir::new();
+    let data = dir.join("data");
+    let source = dir.join("source.md");
+    let target = dir.join("target.md");
+    file::write_atomic(&source, b"source text").expect("source");
+
+    cx.update(|cx| cx.set_global(AppDataRoot(data.clone())));
+    let window = open_window_with_disk(cx, "source text", &source);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+    cx.simulate_keystrokes("end");
+    cx.simulate_input(" updated");
+    cx.dispatch_action(SaveAs);
+    assert!(cx.did_prompt_for_new_path());
+    cx.simulate_new_path_selection(|_| Some(target.clone()));
+    cx.run_until_parked();
+
+    let recent = cx.read(current_recent);
+    assert_eq!(recent.first().map(PathBuf::as_path), Some(target.as_path()));
+
+    let target_versions = backups::versions(&data, &target);
+    assert!(
+        !target_versions
+            .iter()
+            .any(|version| fs::read(version).expect("backup") == b"source text"),
+        "Save As leaked previous file bytes into target backups: {target_versions:?}"
+    );
+    assert!(
+        target_versions
+            .iter()
+            .any(|version| fs::read(version).expect("backup") == b"source text updated"),
+        "Save As did not record target's saved snapshot: {target_versions:?}"
+    );
+}
+
+#[gpui::test]
+fn conflict_reload_snapshots_dirty_buffer_into_backups(cx: &mut TestAppContext) {
+    let dir = TempDir::new();
+    let data = dir.join("data");
+    let path = dir.join("reload-backup.md");
+    file::write_atomic(&path, b"initial").expect("fixture");
+
+    cx.update(|cx| cx.set_global(AppDataRoot(data.clone())));
+    let window = open_window_with_disk(cx, "initial", &path);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let note = window.root(&mut cx).expect("note root");
+
+    cx.simulate_keystrokes("end");
+    cx.simulate_input(" local edit");
+    file::write_atomic(&path, b"external").expect("external write");
+    cx.dispatch_action(Save);
+    cx.run_until_parked();
+    assert!(note.read_with(&cx, |note, _| note.conflict));
+
+    cx.update(|window, cx| {
+        note.update(cx, |note, cx| {
+            note.reload_conflict(&ClickEvent::default(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        note.read_with(&cx, |note, cx| note.editor.read(cx).text().to_owned()),
+        "external"
+    );
+    assert!(!note.read_with(&cx, |note, _| note.conflict));
+
+    let versions = backups::versions(&data, &path);
+    assert!(
+        versions
+            .iter()
+            .any(|version| fs::read(version).expect("backup") == b"initial local edit"),
+        "Reload did not back up dirty buffer bytes before discarding: {versions:?}"
+    );
+}
+
+#[gpui::test]
+fn close_on_conflict_offers_two_step_close_without_saving(cx: &mut TestAppContext) {
+    let dir = TempDir::new();
+    let data = dir.join("data");
+    let path = dir.join("close-conflict.md");
+    file::write_atomic(&path, b"base").expect("fixture");
+
+    cx.update(|cx| cx.set_global(AppDataRoot(data.clone())));
+    let window = open_window_with_disk(cx, "base", &path);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let note = window.root(&mut cx).expect("note root");
+
+    cx.simulate_keystrokes("end");
+    cx.simulate_input(" unsaved");
+    file::write_atomic(&path, b"external").expect("external edit");
+
+    let may_close_immediately =
+        cx.update(|window, cx| note.update(cx, |note, cx| note.should_close(window, cx)));
+    assert!(!may_close_immediately);
+    cx.run_until_parked();
+
+    assert_eq!(
+        note.read_with(&cx, |note, _| (
+            note.conflict,
+            note.offer_discard,
+            note.confirm_discard
+        )),
+        (true, true, false)
+    );
+    cx.update(|window, cx| {
+        note.update(cx, |note, cx| {
+            note.discard_recovered(&ClickEvent::default(), window, cx);
+        });
+    });
+    assert!(note.read_with(&cx, |note, _| note.confirm_discard));
+    assert_eq!(cx.read(|cx| cx.windows().len()), 1);
+
+    cx.update(|window, cx| {
+        note.update(cx, |note, cx| {
+            note.discard_recovered(&ClickEvent::default(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| cx.windows().len()), 0);
+    assert_eq!(file::read(&path).expect("external intact").0, "external");
+
+    let versions = backups::versions(&data, &path);
+    assert!(
+        versions
+            .iter()
+            .any(|version| fs::read(version).expect("backup") == b"base unsaved"),
+        "Close without saving did not back up dirty buffer bytes: {versions:?}"
+    );
+}
+
+#[gpui::test]
+fn quiet_autosave_hides_edited_badge_on_saved_notes_until_conflict(cx: &mut TestAppContext) {
+    let dir = TempDir::new();
+    let path = dir.join("quiet.md");
+    file::write_atomic(&path, b"initial").expect("fixture");
+
+    let window = open_window_with_disk(cx, "initial", &path);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let note = window.root(&mut cx).expect("note root");
+
+    cx.simulate_keystrokes("end");
+    cx.simulate_input(" edit");
+    note.read_with(&cx, |note, cx| {
+        assert!(note.is_dirty(cx));
+        assert!(
+            !note.shows_edited_badge(cx),
+            "normal saved-note edit should stay quiet"
+        );
+        assert_eq!(note.window_title(cx), "quiet");
+    });
+
+    note.update(&mut cx, |note, cx| {
+        note.conflict = true;
+        note.conflict_revision = Some(note.editor.read(cx).revision());
+        cx.notify();
+    });
+    note.read_with(&cx, |note, cx| {
+        assert!(note.shows_edited_badge(cx));
+        assert_eq!(note.window_title(cx), "quiet — Edited");
+    });
+}
+
+#[gpui::test]
+fn footer_chrome_hides_while_typing_and_restores_on_stats_or_pointer(cx: &mut TestAppContext) {
+    let window = open_window(cx, "alpha", None, None);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let note = window.root(&mut cx).expect("note root");
+
+    assert!(!note.read_with(&cx, |note, cx| note.is_chrome_hidden(cx)));
+    cx.simulate_input(" beta");
+    assert!(
+        note.read_with(&cx, |note, cx| note.is_chrome_hidden(cx)),
+        "typing should hide footer chrome"
+    );
+
+    cx.background_executor
+        .advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    assert!(
+        !note.read_with(&cx, |note, cx| note.is_chrome_hidden(cx)),
+        "idle stats completion should restore footer chrome"
+    );
+
+    // Recovered or conflicted notes keep chrome visible even mid-typing.
+    note.update(&mut cx, |note, cx| {
+        note.error = Some("disk full".to_owned());
+        note.typing_chrome_hidden = true;
+        cx.notify();
+    });
+    assert!(!note.read_with(&cx, |note, cx| note.is_chrome_hidden(cx)));
+}
+
+#[gpui::test]
+fn command_palette_filters_and_dispatches_menu_actions(cx: &mut TestAppContext) {
+    let window = open_window(cx, "hello", None, None);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let note = window.root(&mut cx).expect("note root");
+
+    cx.dispatch_action(ToggleCommandPalette);
+    assert!(cx.debug_bounds("command-palette").is_some());
+
+    // Type "typewriter" to filter down to View -> Typewriter Mode and press Enter.
+    cx.simulate_keystrokes("t y p e w r i t e r enter");
+    assert!(
+        cx.debug_bounds("command-palette").is_none(),
+        "Enter should close command palette"
+    );
+    assert!(
+        note.read_with(&cx, |note, cx| note.editor.read(cx).typewriter_enabled()),
+        "palette did not dispatch ToggleTypewriter"
+    );
+}
+
+#[gpui::test]
+fn browse_versions_loads_snapshots_and_restores_undoably(cx: &mut TestAppContext) {
+    let dir = TempDir::new();
+    let data = dir.join("data");
+    let path = dir.join("history.md");
+    file::write_atomic(&path, b"second version").expect("fixture");
+    backups::snapshot(&data, &path, b"first version").expect("snap 1");
+
+    cx.update(|cx| cx.set_global(AppDataRoot(data)));
+    let window = open_window_with_disk(cx, "second version", &path);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let note = window.root(&mut cx).expect("note root");
+
+    cx.dispatch_action(BrowseVersions);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("versions-modal").is_some());
+
+    cx.simulate_keystrokes("enter");
+    assert!(cx.debug_bounds("versions-modal").is_none());
+    assert_eq!(
+        note.read_with(&cx, |note, cx| note.editor.read(cx).text().to_owned()),
+        "first version"
+    );
+
+    cx.dispatch_action(pilcrow_commands::editor_actions::Undo);
+    assert_eq!(
+        note.read_with(&cx, |note, cx| note.editor.read(cx).text().to_owned()),
+        "second version"
+    );
+}
+
+#[test]
+fn version_stamp_formats_relative_buckets() {
+    assert_eq!(
+        overlays::format_version_stamp(1_000_000, 1_010_000),
+        "Just now"
+    );
+    assert_eq!(overlays::format_version_stamp(0, 60_000), "1 minute ago");
+    assert_eq!(
+        overlays::format_version_stamp(0, 5 * 60_000),
+        "5 minutes ago"
+    );
+    assert_eq!(overlays::format_version_stamp(0, 3_600_000), "1 hour ago");
+    assert_eq!(
+        overlays::format_version_stamp(0, 2 * 86_400_000),
+        "2 days ago"
+    );
 }

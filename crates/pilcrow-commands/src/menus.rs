@@ -112,6 +112,7 @@ pub fn menus(options: &MenuOptions) -> [Menu; 6] {
             MenuItem::submenu(Menu::new("Open Recent").items(recent)),
             MenuItem::action("Save", Save),
             MenuItem::action("Save As…", SaveAs),
+            MenuItem::action("Browse Versions…", BrowseVersions),
             MenuItem::action("Export HTML…", ExportHtml),
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
@@ -153,6 +154,8 @@ pub fn menus(options: &MenuOptions) -> [Menu; 6] {
             MenuItem::action("Blockquote", Quote),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Command Palette…", ToggleCommandPalette),
+            MenuItem::separator(),
             MenuItem::submenu(
                 Menu::new("Focus").items([
                     MenuItem::action("Focus Mode", ToggleFocus).checked(options.focus.is_some()),

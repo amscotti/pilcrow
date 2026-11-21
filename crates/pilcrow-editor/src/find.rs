@@ -25,6 +25,9 @@ pub(crate) struct FindState {
     /// leaving the bar open.
     pub(crate) editing: bool,
     pub(crate) case_sensitive: bool,
+    /// Set when Replace / Replace All mutates the document so immediate Cmd+Z
+    /// undoes that replacement without leaving the find bar.
+    pub(crate) replaced_document: bool,
 }
 
 impl FindState {
@@ -74,6 +77,7 @@ impl FindState {
             active: None,
             editing: true,
             case_sensitive,
+            replaced_document: false,
         }
     }
 }

@@ -8,7 +8,8 @@ use super::*;
 
 impl EditorView {
     fn reading_page(&self, window: &Window) -> impl IntoElement {
-        let width = self.measure_column(window);
+        let window_width = window.viewport_size().width / px(1.0);
+        let width = responsive_page_for(window_width, self.measure_column(window)).column;
         reading::page(
             self.buffer.text(),
             width,
@@ -54,12 +55,18 @@ impl Render for EditorView {
             } else {
                 SharedString::from(find.replacement.clone())
             };
-            let query_color = if find.field == FindField::Query && find.editing {
+            let query_active = find.field == FindField::Query && find.editing;
+            let replace_active = find.field == FindField::Replacement && find.editing;
+            let query_color = if find.query.is_empty() {
+                self.tokens.dim
+            } else if query_active {
                 self.tokens.ink
             } else {
                 self.tokens.mid
             };
-            let replacement_color = if find.field == FindField::Replacement && find.editing {
+            let replacement_color = if find.replacement.is_empty() {
+                self.tokens.dim
+            } else if replace_active {
                 self.tokens.ink
             } else {
                 self.tokens.mid
@@ -68,6 +75,7 @@ impl Render for EditorView {
                 .id("find-bar")
                 .debug_selector(|| "find-bar".into())
                 .occlude()
+                .font_family(BODY_FONT)
                 .flex()
                 .items_center()
                 .gap_2()
@@ -84,7 +92,15 @@ impl Render for EditorView {
                         .min_w(px(80.0))
                         .px_2()
                         .py_1()
-                        .cursor_pointer()
+                        .rounded(px(3.0))
+                        .bg(self.tokens.paper)
+                        .border_1()
+                        .border_color(if query_active {
+                            self.tokens.accent
+                        } else {
+                            self.tokens.rule
+                        })
+                        .cursor(CursorStyle::IBeam)
                         .text_color(query_color)
                         .child(query)
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_find_query)),
@@ -130,7 +146,15 @@ impl Render for EditorView {
                         .min_w(px(80.0))
                         .px_2()
                         .py_1()
-                        .cursor_pointer()
+                        .rounded(px(3.0))
+                        .bg(self.tokens.paper)
+                        .border_1()
+                        .border_color(if replace_active {
+                            self.tokens.accent
+                        } else {
+                            self.tokens.rule
+                        })
+                        .cursor(CursorStyle::IBeam)
                         .text_color(replacement_color)
                         .child(replacement)
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_find_replace)),
@@ -166,7 +190,6 @@ impl Render for EditorView {
         let mut root = div()
             .id("editor")
             .key_context("Editor")
-            .cursor(CursorStyle::IBeam)
             .size_full()
             .flex()
             .flex_col()
@@ -184,7 +207,9 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::doc_start))
             .on_action(cx.listener(Self::doc_end))
             .on_action(cx.listener(Self::insert_newline))
+            .on_action(cx.listener(Self::shift_enter))
             .on_action(cx.listener(Self::insert_tab))
+            .on_action(cx.listener(Self::switch_find_field_action))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
@@ -257,6 +282,7 @@ impl Render for EditorView {
                 div()
                     .id("page-column")
                     .debug_selector(|| "prose-input".into())
+                    .cursor(CursorStyle::IBeam)
                     .role(Role::MultilineTextInput)
                     .aria_label("Note")
                     .aria_value(SharedString::from(a11y_text))
@@ -361,11 +387,12 @@ impl Element for ProseElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let viewport = ((bounds.size.height - HEAD_PX) / px(1.0)).max(0.0);
+        let window_width = bounds.size.width / px(1.0);
         let column = self.editor.update(cx, |editor, _cx| {
             if editor.trace_active {
                 editor.trace_frame_started = Some(Instant::now());
             }
-            editor.ensure_layout(window, viewport)
+            editor.ensure_layout(window, window_width, viewport)
         });
         let editor = self.editor.read(cx);
         let text = editor.buffer.text();
@@ -375,13 +402,14 @@ impl Element for ProseElement {
             .layout
             .as_ref()
             .expect("ensure_layout always installs a layout");
-        let page = page_for(bounds.size.width / px(1.0), column);
+        let page = responsive_page_for(window_width, column);
         let page_left = bounds.left() + px(page.margin.max(layout.max_hang()));
         // The scrollbar's extent is the estimated document height, so it
         // reaches the end of a long note before the frontier does; the
         // exact `covered` check below still gates frame requests on
         // placed lines only.
-        let max_scroll = (editor.estimated_total.max(layout.total()) - viewport).max(0.0);
+        let max_scroll =
+            editor.max_scroll_for(editor.estimated_total.max(layout.total()), viewport);
         let mut scroll = editor.scroll.clamp(0.0, max_scroll);
         let resized = editor.last_bounds.is_some_and(|last| {
             last.size.width != bounds.size.width || last.size.height != bounds.size.height
@@ -397,6 +425,7 @@ impl Element for ProseElement {
             scroll = scroll.clamp(0.0, max_scroll);
         }
         if editor.typewriter
+            && (resized || editor.reveal_pending)
             && let Some((y, h)) = editor.caret_band(layout)
         {
             scroll = (y + h * 0.5 - viewport * 0.5).clamp(0.0, max_scroll);
@@ -410,8 +439,9 @@ impl Element for ProseElement {
         let last_y = scroll + viewport + RUN_DOWN;
         let mut lines = Vec::new();
         let mut search_quads = Vec::new();
-        let mut spell_quads = Vec::new();
+        let mut spell_underlines = Vec::new();
         let mut selection_quads = Vec::new();
+        let mut inline_code_quads = Vec::new();
         let mut code_backgrounds = Vec::new();
         let mut rules = Vec::new();
         let mut task_hits = Vec::new();
@@ -420,7 +450,7 @@ impl Element for ProseElement {
         if cache.revision != editor.buffer.revision()
             || cache.width != column
             || cache.scale != editor.scale
-            || cache.ink != Some(editor.tokens.ink)
+            || cache.tokens != Some(editor.tokens)
             || cache.marked != editor.marked
             || cache.focus != focus
         {
@@ -428,7 +458,7 @@ impl Element for ProseElement {
             cache.revision = editor.buffer.revision();
             cache.width = column;
             cache.scale = editor.scale;
-            cache.ink = Some(editor.tokens.ink);
+            cache.tokens = Some(editor.tokens);
             cache.marked = editor.marked.clone();
             cache.focus = focus;
         }
@@ -515,6 +545,53 @@ impl Element for ProseElement {
             };
 
             if !placed.rule
+                && block.kind != BlockKind::Code
+                && text.as_bytes()[block.start..block.end].contains(&b'`')
+            {
+                let kinds = kinds_cache
+                    .entry(block_index)
+                    .or_insert_with(|| {
+                        let full = &text[block.start..block.end];
+                        let mut kinds = vec![InlineKind::Plain; full.len()];
+                        inline_kinds(full, &mut kinds);
+                        apply_block_markers(block, full, &mut kinds);
+                        Rc::new(kinds)
+                    })
+                    .clone();
+                let local_start = placed.start as usize;
+                let local_end = placed.end as usize;
+                let mut i = local_start;
+                while i < local_end {
+                    if kinds.get(i).copied() == Some(InlineKind::Code) {
+                        let run_start = i;
+                        while i < local_end && kinds.get(i).copied() == Some(InlineKind::Code) {
+                            i += 1;
+                        }
+                        let x0 = shaped.x_for_index(run_start - local_start);
+                        let x1 = shaped.x_for_index(i - local_start);
+                        inline_code_quads.push(
+                            fill(
+                                Bounds::new(
+                                    point(
+                                        line_bounds.left() + x0 - px(2.0),
+                                        line_bounds.top() + px(2.0),
+                                    ),
+                                    size(
+                                        (x1 - x0).max(px(1.0)) + px(4.0),
+                                        (px(placed.h) - px(4.0)).max(px(1.0)),
+                                    ),
+                                ),
+                                editor.tokens.code_bg,
+                            )
+                            .corner_radii(px(3.0)),
+                        );
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+
+            if !placed.rule
                 && let Some(task) = task_visual(block, &text[block.start..block.end])
                 && abs_start <= block.start + task.box_start
                 && block.start + task.box_end <= abs_end
@@ -585,12 +662,9 @@ impl Element for ProseElement {
                     }
                     let x0 = shaped.x_for_index(from - abs_start);
                     let x1 = shaped.x_for_index(to - abs_start);
-                    spell_quads.push(fill(
-                        Bounds::new(
-                            point(line_bounds.left() + x0, line_bounds.bottom() - px(1.5)),
-                            size((x1 - x0).max(px(1.0)), px(1.5)),
-                        ),
-                        editor.tokens.spell,
+                    spell_underlines.push((
+                        point(line_bounds.left() + x0, line_bounds.bottom() - px(2.0)),
+                        (x1 - x0).max(px(1.0)),
                     ));
                 }
             }
@@ -614,10 +688,35 @@ impl Element for ProseElement {
             }
 
             if block.kind == BlockKind::Code {
-                code_backgrounds.push(fill(
-                    Bounds::new(point(page_left, line_top), size(px(column), px(placed.h))),
-                    editor.tokens.code_bg,
-                ));
+                let is_first = (block_index == 0
+                    || editor.blocks[block_index - 1].kind != BlockKind::Code)
+                    && placed.start == 0;
+                let is_last = (block_index + 1 == editor.blocks.len()
+                    || editor.blocks[block_index + 1].kind != BlockKind::Code)
+                    && block.start + placed.end as usize >= block.end.saturating_sub(1);
+                let top = if is_first {
+                    line_top - px(4.0)
+                } else {
+                    line_top
+                };
+                let extra_h =
+                    px(if is_first { 4.0 } else { 0.0 }) + px(if is_last { 4.0 } else { 0.0 });
+                let corners = gpui::Corners {
+                    top_left: px(if is_first { 4.0 } else { 0.0 }),
+                    top_right: px(if is_first { 4.0 } else { 0.0 }),
+                    bottom_left: px(if is_last { 4.0 } else { 0.0 }),
+                    bottom_right: px(if is_last { 4.0 } else { 0.0 }),
+                };
+                code_backgrounds.push(
+                    fill(
+                        Bounds::new(
+                            point(page_left - px(12.0), top),
+                            size(px(column) + px(24.0), px(placed.h) + extra_h),
+                        ),
+                        editor.tokens.code_bg,
+                    )
+                    .corner_radii(corners),
+                );
             }
             if placed.rule {
                 rules.push(fill(
@@ -639,16 +738,31 @@ impl Element for ProseElement {
             });
         }
 
-        let caret = editor
-            .caret_bounds_in(&lines, bounds, scroll, page_left)
-            .map(|bounds| fill(bounds, editor.tokens.ink));
+        let caret = if selection.is_some() {
+            None
+        } else {
+            editor
+                .caret_bounds_in(&lines, bounds, scroll, page_left)
+                .map(|logical| {
+                    let optical_h = logical.size.height * (1.22 / LEADING);
+                    let pad = (logical.size.height - optical_h) * 0.5;
+                    fill(
+                        Bounds::new(
+                            point(logical.origin.x, logical.origin.y + pad),
+                            size(CARET_WIDTH, optical_h),
+                        ),
+                        editor.tokens.accent,
+                    )
+                })
+        };
 
         Self::PrepaintState {
             lines,
             search: search_quads,
-            spell: spell_quads,
+            spell: spell_underlines,
             selection: selection_quads,
             caret,
+            inline_code_quads,
             code_backgrounds,
             rules,
             task_hits,
@@ -714,6 +828,7 @@ impl Element for ProseElement {
         );
         let in_page =
             |rect: Bounds<Pixels>| rect.bottom() > page_top && rect.top() < bounds.bottom();
+        let spell_color = self.editor.read(cx).tokens.spell;
         window.with_content_mask(
             Some(ContentMask {
                 bounds: page_bounds,
@@ -724,14 +839,27 @@ impl Element for ProseElement {
                         window.paint_quad(quad);
                     }
                 }
+                for quad in prepaint.inline_code_quads.drain(..) {
+                    if in_page(quad.bounds) {
+                        window.paint_quad(quad);
+                    }
+                }
                 for quad in prepaint.search.drain(..) {
                     if in_page(quad.bounds) {
                         window.paint_quad(quad);
                     }
                 }
-                for quad in prepaint.spell.drain(..) {
-                    if in_page(quad.bounds) {
-                        window.paint_quad(quad);
+                for (origin, width) in prepaint.spell.drain(..) {
+                    if origin.y > page_top && origin.y < bounds.bottom() {
+                        window.paint_underline(
+                            origin,
+                            width,
+                            &UnderlineStyle {
+                                thickness: px(1.5),
+                                color: Some(spell_color),
+                                wavy: true,
+                            },
+                        );
                     }
                 }
                 for quad in prepaint.selection.drain(..) {

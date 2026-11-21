@@ -43,12 +43,13 @@ pub use pilcrow_commands::keymap::Platform;
 use pilcrow_core::style::{self, Look};
 use pilcrow_core::{
     Applied, Block, BlockKind, Buffer, Edit, EditGroup, FormatCommand, History, InlineKind, Layout,
-    MeasureStyle, Measurer, Placed, Stats, boundary_at_or_before, compute_stats, format_command,
-    inline_kinds, inline_links, lists, rescan_from, scan_blocks, search as text_search,
+    MeasureStyle, Measurer, Placed, Stats, boundary_at_or_before, compute_stats, display, export,
+    format_command, inline, inline_kinds, inline_links, lists, rescan_from, scan_blocks,
+    search as text_search,
 };
-use pilcrow_ui::page::{Page, page_for};
+use pilcrow_ui::page::{Page, responsive_page_for};
 use pilcrow_ui::theme::Tokens;
-use pilcrow_ui::typography::{BODY_SIZE, HEAD, MEASURE_CHARS, line_height};
+use pilcrow_ui::typography::{BODY_SIZE, HEAD, LEADING, MEASURE_CHARS, line_height};
 use unicode_segmentation::UnicodeSegmentation;
 
 // The bundled IBM Plex Mono (see `api::install_fonts`) is the one face the
@@ -59,7 +60,7 @@ const FONT_SIZE: Pixels = px(BODY_SIZE);
 const LINE_HEIGHT_F32: f32 = line_height();
 const LINE_HEIGHT: Pixels = px(LINE_HEIGHT_F32);
 const HEAD_PX: Pixels = px(HEAD);
-const CARET_WIDTH: Pixels = px(1.5);
+const CARET_WIDTH: Pixels = px(2.0);
 
 /// How much extra document above and below the viewport is shaped. The glyphs
 /// are ready when a line straddles an edge; the paint loop drops lines that
@@ -461,7 +462,7 @@ struct ShapeCache {
     revision: u64,
     width: f32,
     scale: f32,
-    ink: Option<Hsla>,
+    tokens: Option<Tokens>,
     marked: Option<Range<usize>>,
     focus: Option<FocusView>,
     lines: HashMap<LineKey, ShapedLine>,
@@ -473,7 +474,7 @@ impl ShapeCache {
             revision: u64::MAX,
             width: f32::NAN,
             scale: f32::NAN,
-            ink: None,
+            tokens: None,
             marked: None,
             focus: None,
             lines: HashMap::new(),
@@ -484,9 +485,10 @@ impl ShapeCache {
 struct PrepaintState {
     lines: Vec<LineGeometry>,
     search: Vec<PaintQuad>,
-    spell: Vec<PaintQuad>,
+    spell: Vec<(gpui::Point<Pixels>, Pixels)>,
     selection: Vec<PaintQuad>,
     caret: Option<PaintQuad>,
+    inline_code_quads: Vec<PaintQuad>,
     code_backgrounds: Vec<PaintQuad>,
     rules: Vec<PaintQuad>,
     task_hits: Vec<TaskBox>,
@@ -1063,6 +1065,36 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Replace the whole document as one undoable step (for Browse Versions
+    /// restore), leaving undo/redo history intact.
+    pub fn replace_document_undoable(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reading {
+            self.reading = false;
+            cx.emit(EditorEvent::ModeChanged);
+        }
+        self.commit_composition(window);
+        self.history.break_group();
+        if text == self.buffer.text() {
+            self.caret = 0;
+            self.anchor = None;
+            self.reveal_caret();
+            window.notify_text_selection_changed(&self.focus_handle);
+            cx.notify();
+            return;
+        }
+        self.replace_range(0..self.buffer.len(), text, EditGroup::Other, window, cx);
+        self.caret = 0;
+        self.anchor = None;
+        self.reveal_caret();
+        window.notify_text_selection_changed(&self.focus_handle);
+        cx.notify();
+    }
+
     /// Whether the find bar is open.
     pub fn is_finding(&self) -> bool {
         self.find.is_some()
@@ -1139,6 +1171,7 @@ impl EditorView {
         if let Some(find) = self.find.as_mut() {
             find.editing = true;
             find.field = FindField::Query;
+            find.replaced_document = false;
             self.refresh_find(true, Some(window), cx);
             return;
         }
@@ -1203,12 +1236,13 @@ impl EditorView {
     fn focus_find_query(
         &mut self,
         _: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(find) = self.find.as_mut() {
             find.editing = true;
             find.field = FindField::Query;
+            self.focus_handle.focus(window, cx);
             cx.notify();
         }
     }
@@ -1216,12 +1250,13 @@ impl EditorView {
     fn focus_find_replace(
         &mut self,
         _: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(find) = self.find.as_mut() {
             find.editing = true;
             find.field = FindField::Replacement;
+            self.focus_handle.focus(window, cx);
             cx.notify();
         }
     }
@@ -1248,6 +1283,7 @@ impl EditorView {
         if text.is_empty() {
             return;
         }
+        find.replaced_document = false;
         let cursor = find.cursor();
         find.value_mut().insert_str(cursor, &text);
         *find.cursor_mut() = cursor + text.len();
@@ -1278,6 +1314,7 @@ impl EditorView {
             }
             previous
         };
+        find.replaced_document = false;
         find.value_mut().replace_range(previous..cursor, "");
         *find.cursor_mut() = previous;
         let query_changed = find.field == FindField::Query;
@@ -1302,6 +1339,7 @@ impl EditorView {
             .graphemes(true)
             .next()
             .map_or(value.len(), |grapheme| cursor + grapheme.len());
+        find.replaced_document = false;
         find.value_mut().replace_range(cursor..end, "");
         let query_changed = find.field == FindField::Query;
         if query_changed {
@@ -1370,15 +1408,23 @@ impl EditorView {
         if all {
             let ranges = find.matches.clone();
             let text = self.buffer.text();
+            let mapped_caret =
+                map_caret_across_replacements(self.caret, &ranges, replacement.len());
             let replaced = text_search::replace_ranges(text, &ranges, &replacement);
             if replaced != text {
                 let old = text.to_owned();
-                self.replace_range(0..old.len(), &replaced, EditGroup::Other, window, cx);
+                self.replace_range(0..old.len(), &replaced, EditGroup::ReplaceAll, window, cx);
+                self.caret = boundary_at_or_before(self.buffer.text(), mapped_caret);
+                self.anchor = None;
+                self.desired_x = None;
+                self.reveal_caret();
+                window.notify_text_selection_changed(&self.focus_handle);
                 if let Some(find) = self.find.as_mut() {
-                    find.active = Some(0);
+                    find.active = None;
+                    find.replaced_document = true;
                 }
             }
-            self.refresh_find(true, Some(window), cx);
+            self.refresh_find(false, Some(window), cx);
             return;
         }
         let Some(range) = self.active_find_match() else {
@@ -1389,6 +1435,7 @@ impl EditorView {
         let Some(find) = self.find.as_mut() else {
             return;
         };
+        find.replaced_document = true;
         find.matches = text_search::find_all(self.buffer.text(), &find.query, find.case_sensitive);
         find.active =
             text_search::next_index(&find.matches, start.saturating_add(replacement.len()), true);
@@ -1452,12 +1499,86 @@ impl EditorView {
     }
 
     fn toggle_reading(&mut self, _: &ToggleReading, _window: &mut Window, cx: &mut Context<Self>) {
-        self.reading = !self.reading;
+        let entering = !self.reading;
+        let display_blocks = display::blocks(self.buffer.text());
+        if entering {
+            let doc_offset = if self.scroll <= 1.0 {
+                0
+            } else if let Some(layout) = self.layout.as_ref() {
+                layout
+                    .lines()
+                    .iter()
+                    .find(|line| line.y + line.h > self.scroll)
+                    .and_then(|line| {
+                        self.blocks
+                            .get(line.block as usize)
+                            .map(|b| b.start + line.start as usize)
+                    })
+                    .unwrap_or(self.caret)
+            } else {
+                self.caret
+            };
+            let target_item = if self.scroll <= 1.0 || display_blocks.is_empty() {
+                0
+            } else {
+                display_blocks
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, block)| block.source_start <= doc_offset)
+                    .map_or(0, |(index, _)| index)
+            };
+            if target_item == 0 {
+                self.reading_scroll.set_offset(point(px(0.0), px(0.0)));
+            } else {
+                self.reading_scroll.scroll_to_top_of_item(target_item);
+            }
+            self.reveal_pending = true;
+        } else {
+            let offset_y = self.reading_scroll.offset().y;
+            let top_item = self.reading_scroll.top_item();
+            if offset_y >= px(-1.0) || top_item == 0 {
+                self.scroll = 0.0;
+                self.reveal_pending = false;
+            } else {
+                let target_scroll = display_blocks
+                    .get(top_item)
+                    .and_then(|display_block| {
+                        let block_index =
+                            block_index_for_offset(&self.blocks, display_block.source_start);
+                        self.layout
+                            .as_ref()
+                            .and_then(|layout| layout.block_top(block_index))
+                    })
+                    .or_else(|| {
+                        let total = self
+                            .layout
+                            .as_ref()
+                            .map(|l| self.estimated_total.max(l.total()))
+                            .unwrap_or(0.0);
+                        let len = display_blocks.len().max(1) as f32;
+                        Some((total * (top_item as f32 / len)).max(0.0))
+                    });
+                if let Some(scroll) = target_scroll {
+                    let viewport = self
+                        .last_bounds
+                        .map(|b| ((b.size.height - HEAD_PX) / px(1.0)).max(0.0))
+                        .unwrap_or(0.0);
+                    let total = self
+                        .layout
+                        .as_ref()
+                        .map(|l| self.estimated_total.max(l.total()))
+                        .unwrap_or(scroll + viewport);
+                    self.reading = false;
+                    self.scroll = scroll.clamp(0.0, self.max_scroll_for(total, viewport));
+                    self.reveal_pending = false;
+                }
+            }
+        }
+        self.reading = entering;
         if let Some(find) = self.find.take() {
             self.last_find = Some((find.query, find.replacement, find.case_sensitive));
         }
-        self.reading_scroll.set_offset(point(px(0.0), px(0.0)));
-        self.reveal_pending = true;
         cx.emit(EditorEvent::ModeChanged);
         cx.notify();
     }
@@ -1606,7 +1727,7 @@ impl EditorView {
                 self.caret = start;
             }
         }
-        self.invalidate_after_edit(old_revision, start, edit_end, cx);
+        self.invalidate_after_edit(old_revision, start, end, edit_end, cx);
     }
 
     /// Ends a live composition before a normal edit or command. Leaving a
@@ -1665,7 +1786,13 @@ impl EditorView {
                 self.now_ms(),
             );
         }
-        self.invalidate_after_edit(old_revision, edit_start, edit_start + text.len(), cx);
+        self.invalidate_after_edit(
+            old_revision,
+            edit_start,
+            edit_end,
+            edit_start + text.len(),
+            cx,
+        );
         self.anchor = None;
         self.marked = None;
         self.desired_x = None;
@@ -1676,8 +1803,9 @@ impl EditorView {
     }
 
     /// Rescan the blocks from the block before the edit and resume the layout
-    /// at the earliest block whose geometry can have changed. `edit_end` is
-    /// the byte offset in the new text just past the inserted replacement.
+    /// at the earliest block whose geometry can have changed. `old_edit_end`
+    /// is the pre-edit byte offset just past the replaced slice, and
+    /// `edit_end` is the post-edit offset just past the inserted replacement.
     /// The rescan stops at the first blank line past the edit where it
     /// resynchronises with the old block table (see `rescan_from`), so an
     /// edit in a long note costs about a paragraph of scanning, not the whole
@@ -1688,6 +1816,7 @@ impl EditorView {
         &mut self,
         old_revision: u64,
         edit_start: usize,
+        old_edit_end: usize,
         edit_end: usize,
         cx: &mut Context<Self>,
     ) {
@@ -1768,7 +1897,7 @@ impl EditorView {
         self.blocks = next_blocks;
         self.refresh_find(false, None, cx);
         self.schedule_stats(cx);
-        self.spell.clear();
+        adjust_spell_ranges(&mut self.spell, edit_start, old_edit_end, edit_end);
         self.schedule_spellcheck(cx);
     }
 
@@ -1973,7 +2102,7 @@ impl EditorView {
     }
 
     fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ime_owns_movement() {
+        if self.find_editing() || self.ime_owns_movement() {
             return;
         }
         self.commit_composition(window);
@@ -1989,7 +2118,7 @@ impl EditorView {
     }
 
     fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ime_owns_movement() {
+        if self.find_editing() || self.ime_owns_movement() {
             return;
         }
         self.commit_composition(window);
@@ -2005,6 +2134,10 @@ impl EditorView {
     }
 
     fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_line_step(-1.0, cx);
+            return;
+        }
         if self.find.as_ref().is_some_and(|find| find.editing) {
             self.find_step(false, window, cx);
             return;
@@ -2018,6 +2151,10 @@ impl EditorView {
     }
 
     fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_line_step(1.0, cx);
+            return;
+        }
         if self.find.as_ref().is_some_and(|find| find.editing) {
             self.find_step(true, window, cx);
             return;
@@ -2106,8 +2243,9 @@ impl EditorView {
     /// Make sure the placed page covers the caret's block and the viewport
     /// plus one page of run-up. The work is bounded: if the caret is at the far
     /// end of a very long note, the next frame continues from the frontier.
-    fn ensure_layout(&mut self, window: &mut Window, viewport: f32) -> f32 {
-        let column = self.measure_column(window);
+    fn ensure_layout(&mut self, window: &mut Window, window_width: f32, viewport: f32) -> f32 {
+        let desired = self.measure_column(window);
+        let column = responsive_page_for(window_width, desired).column;
         self.layout_width = column;
         let revision = self.buffer.revision();
         if self
@@ -2292,7 +2430,12 @@ impl EditorView {
             .viewport()
             .map(|(_, height)| height)
             .unwrap_or_default();
-        self.ensure_layout(window, viewport);
+        let window_width = self
+            .last_bounds
+            .map_or(window.viewport_size().width / px(1.0), |b| {
+                b.size.width / px(1.0)
+            });
+        self.ensure_layout(window, window_width, viewport);
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
@@ -2368,7 +2511,36 @@ impl EditorView {
         cx.notify();
     }
 
+    fn visual_line_bounds(&self, offset: usize) -> (usize, usize) {
+        if let Some(layout) = self.layout.as_ref()
+            && let Some(line_index) = self.placed_line_index(layout, offset)
+            && let Some(placed) = layout.lines().get(line_index)
+            && !placed.rule
+            && let Some(block) = self.blocks.get(placed.block as usize)
+        {
+            let start = block.start + placed.start as usize;
+            let end = block.start + placed.end as usize;
+            if offset >= start && offset <= end {
+                return (start, end);
+            }
+        }
+        let line = self.buffer.line_of(offset);
+        (self.buffer.line_start(line), self.buffer.line_end(line))
+    }
+
+    fn ensure_visual_layout(&mut self, window: &mut Window) {
+        if let Some(bounds) = self.last_bounds {
+            let window_width = bounds.size.width / px(1.0);
+            let viewport = ((bounds.size.height - HEAD_PX) / px(1.0)).max(0.0);
+            self.ensure_layout(window, window_width, viewport);
+        }
+    }
+
     fn home(&mut self, _: &Home, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_edge(false, cx);
+            return;
+        }
         if let Some(find) = self.find.as_mut().filter(|find| find.editing) {
             *find.cursor_mut() = 0;
             cx.notify();
@@ -2376,7 +2548,8 @@ impl EditorView {
         }
         self.commit_composition(window);
         self.history.break_group();
-        self.caret = self.buffer.line_start(self.buffer.line_of(self.caret));
+        self.ensure_visual_layout(window);
+        self.caret = self.visual_line_bounds(self.caret).0;
         self.anchor = None;
         self.desired_x = None;
         self.reveal_caret();
@@ -2385,6 +2558,10 @@ impl EditorView {
     }
 
     fn end(&mut self, _: &End, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reading_edge(true, cx);
+            return;
+        }
         if self.find.as_ref().is_some_and(|find| find.editing) {
             let Some(find) = self.find.as_mut() else {
                 return;
@@ -2396,7 +2573,8 @@ impl EditorView {
         }
         self.commit_composition(window);
         self.history.break_group();
-        self.caret = self.buffer.line_end(self.buffer.line_of(self.caret));
+        self.ensure_visual_layout(window);
+        self.caret = self.visual_line_bounds(self.caret).1;
         self.anchor = None;
         self.desired_x = None;
         self.reveal_caret();
@@ -2419,6 +2597,13 @@ impl EditorView {
     }
 
     fn doc_start(&mut self, _: &DocStart, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_editing() {
+            return;
+        }
+        if self.reading {
+            self.reading_edge(false, cx);
+            return;
+        }
         self.commit_composition(window);
         self.history.break_group();
         self.caret = 0;
@@ -2430,6 +2615,13 @@ impl EditorView {
     }
 
     fn doc_end(&mut self, _: &DocEnd, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find_editing() {
+            return;
+        }
+        if self.reading {
+            self.reading_edge(true, cx);
+            return;
+        }
         self.commit_composition(window);
         self.history.break_group();
         self.caret = self.buffer.len();
@@ -2443,7 +2635,7 @@ impl EditorView {
     fn insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(find) = self.find.as_ref().filter(|find| find.editing) {
             if find.field == FindField::Replacement {
-                self.insert_find_text("\n", window, cx);
+                self.replace_current_match(false, window, cx);
             } else {
                 self.find_step(true, window, cx);
             }
@@ -2493,13 +2685,170 @@ impl EditorView {
         );
     }
 
+    fn indent_or_outdent_list(
+        &mut self,
+        indent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.reading {
+            return false;
+        }
+        let sel_start = self.selection_start();
+        let sel_end = self.selection_end();
+        let effective_end = if sel_start < sel_end
+            && sel_end > 0
+            && self.buffer.text().as_bytes().get(sel_end - 1) == Some(&b'\n')
+        {
+            sel_end - 1
+        } else {
+            sel_end
+        };
+        let first_line = self.buffer.line_of(sel_start);
+        let last_line = self.buffer.line_of(effective_end);
+        let text = self.buffer.text();
+        let mut saw_list = false;
+        for line in first_line..=last_line {
+            let ls = self.buffer.line_start(line);
+            let le = self.buffer.line_end(line);
+            let slice = &text[ls..le];
+            if slice.trim_matches([' ', '\t']).is_empty() {
+                continue;
+            }
+            let block_index = block_index_for_offset(&self.blocks, ls);
+            let in_list = self
+                .blocks
+                .get(block_index)
+                .is_some_and(|b| b.kind == BlockKind::ListItem)
+                || lists::parse(slice.as_bytes()).is_some();
+            if !in_list {
+                return false;
+            }
+            saw_list = true;
+        }
+        if !saw_list {
+            return false;
+        }
+
+        let range_start = self.buffer.line_start(first_line);
+        let range_end = self.buffer.line_end(last_line);
+        let mut replacement = String::with_capacity((range_end - range_start) + 16);
+        let mut cum_delta: isize = 0;
+        let mut line_maps: Vec<(usize, usize, isize, isize, usize)> = Vec::new();
+        for line in first_line..=last_line {
+            if line > first_line {
+                replacement.push('\n');
+            }
+            let ls = self.buffer.line_start(line);
+            let le = self.buffer.line_end(line);
+            let slice = &text[ls..le];
+            let line_delta: isize;
+            let removed: usize;
+            if indent {
+                if !slice.is_empty() {
+                    replacement.push_str("  ");
+                    line_delta = 2;
+                } else {
+                    line_delta = 0;
+                }
+                removed = 0;
+                replacement.push_str(slice);
+            } else {
+                removed = if slice.starts_with("  ") {
+                    2
+                } else if slice.starts_with(' ') || slice.starts_with('\t') {
+                    1
+                } else {
+                    0
+                };
+                line_delta = -(removed as isize);
+                replacement.push_str(&slice[removed..]);
+            }
+            line_maps.push((ls, le, cum_delta, line_delta, removed));
+            cum_delta += line_delta;
+        }
+        if replacement == text[range_start..range_end] {
+            return true;
+        }
+
+        let map_offset = |pos: usize| -> usize {
+            for &(ls, le, before, delta, removed) in &line_maps {
+                if pos >= ls && pos <= le {
+                    if delta >= 0 {
+                        return (pos as isize + before + delta).max(0) as usize;
+                    }
+                    let within = (pos - ls).saturating_sub(removed);
+                    return (ls as isize + before + within as isize).max(0) as usize;
+                }
+            }
+            (pos as isize + cum_delta).max(0) as usize
+        };
+        let old_caret = self.caret;
+        let old_anchor = self.anchor;
+        let had_selection = old_anchor.is_some_and(|a| a != old_caret);
+        let mapped_caret = map_offset(old_caret);
+        let mapped_anchor = old_anchor.map(map_offset);
+
+        self.replace_range(
+            range_start..range_end,
+            &replacement,
+            EditGroup::Other,
+            window,
+            cx,
+        );
+        self.caret = mapped_caret.min(self.buffer.len());
+        self.anchor = if had_selection {
+            mapped_anchor.map(|a| a.min(self.buffer.len()))
+        } else {
+            None
+        };
+        if let Some(a) = self.anchor
+            && a != self.caret
+        {
+            self.history.set_last_selection_after(Some((a, self.caret)));
+        }
+        self.reveal_caret();
+        window.notify_text_selection_changed(&self.focus_handle);
+        cx.notify();
+        true
+    }
+
     fn insert_tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.find.as_ref().is_some_and(|find| find.editing) {
             self.switch_find_field(window, cx);
             return;
         }
         self.commit_composition(window);
+        if self.indent_or_outdent_list(true, window, cx) {
+            return;
+        }
         self.edit_selection_or("\t", EditGroup::Other, window, cx);
+    }
+
+    fn shift_enter(&mut self, _: &ShiftEnter, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = self.find.as_ref().filter(|find| find.editing) {
+            if find.field == FindField::Replacement {
+                self.replace_current_match(true, window, cx);
+            } else {
+                self.find_step(false, window, cx);
+            }
+            return;
+        }
+        self.insert_newline(&InsertNewline, window, cx);
+    }
+
+    fn switch_find_field_action(
+        &mut self,
+        _: &SwitchFindField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.find_editing() {
+            self.switch_find_field(window, cx);
+            return;
+        }
+        self.commit_composition(window);
+        let _ = self.indent_or_outdent_list(false, window, cx);
     }
 
     fn move_word(
@@ -2557,6 +2906,7 @@ impl EditorView {
     fn delete_to_line(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_editing() {
             if let Some(find) = self.find.as_mut() {
+                find.replaced_document = false;
                 let cursor = find.cursor().min(find.value().len());
                 if forward {
                     find.value_mut().truncate(cursor);
@@ -2578,12 +2928,9 @@ impl EditorView {
             self.edit_selection_or("", EditGroup::Delete, window, cx);
             return;
         }
-        let line = self.buffer.line_of(self.caret);
-        let target = if forward {
-            self.buffer.line_end(line)
-        } else {
-            self.buffer.line_start(line)
-        };
+        self.ensure_visual_layout(window);
+        let (vis_start, vis_end) = self.visual_line_bounds(self.caret);
+        let target = if forward { vis_end } else { vis_start };
         let (from, to) = (self.caret.min(target), self.caret.max(target));
         if from != to {
             self.replace_range(from..to, "", EditGroup::Delete, window, cx);
@@ -2624,12 +2971,9 @@ impl EditorView {
         if self.anchor.is_none() {
             self.anchor = Some(self.caret);
         }
-        let line = self.buffer.line_of(self.caret);
-        self.caret = if forward {
-            self.buffer.line_end(line)
-        } else {
-            self.buffer.line_start(line)
-        };
+        self.ensure_visual_layout(window);
+        let (vis_start, vis_end) = self.visual_line_bounds(self.caret);
+        self.caret = if forward { vis_end } else { vis_start };
         self.desired_x = None;
         self.reveal_caret();
         window.notify_text_selection_changed(&self.focus_handle);
@@ -2658,7 +3002,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.find_editing() {
+        if self.reading || self.find_editing() {
             return;
         }
         self.commit_composition(window);
@@ -2762,6 +3106,7 @@ impl EditorView {
             let Some(find) = self.find.as_mut() else {
                 return;
             };
+            find.replaced_document = false;
             cx.write_to_clipboard(ClipboardItem::new_string(find.value().to_owned()));
             find.value_mut().clear();
             *find.cursor_mut() = 0;
@@ -2807,33 +3152,48 @@ impl EditorView {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reading {
+        if self.reading
+            || (self.find_editing()
+                && !self
+                    .find
+                    .as_ref()
+                    .is_some_and(|find| find.replaced_document))
+        {
             return;
         }
         self.commit_composition(window);
         let old_revision = self.buffer.revision();
+        let old_len = self.buffer.len();
         let Some(applied) = self.history.undo(&mut self.buffer) else {
             return;
         };
-        self.after_history(applied, old_revision, window, cx);
+        self.after_history(applied, old_revision, old_len, window, cx);
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reading {
+        if self.reading
+            || (self.find_editing()
+                && !self
+                    .find
+                    .as_ref()
+                    .is_some_and(|find| find.replaced_document))
+        {
             return;
         }
         self.commit_composition(window);
         let old_revision = self.buffer.revision();
+        let old_len = self.buffer.len();
         let Some(applied) = self.history.redo(&mut self.buffer) else {
             return;
         };
-        self.after_history(applied, old_revision, window, cx);
+        self.after_history(applied, old_revision, old_len, window, cx);
     }
 
     fn after_history(
         &mut self,
         applied: Applied,
         old_revision: u64,
+        old_len: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2842,7 +3202,9 @@ impl EditorView {
         self.marked = None;
         self.composition = None;
         self.desired_x = None;
-        self.invalidate_after_edit(old_revision, applied.start, applied.end, cx);
+        let old_edit_end = (applied.end as isize + old_len as isize - self.buffer.len() as isize)
+            .max(applied.start as isize) as usize;
+        self.invalidate_after_edit(old_revision, applied.start, old_edit_end, applied.end, cx);
         self.reveal_caret();
         window.notify_text_input_changed(&self.focus_handle);
         window.notify_text_selection_changed(&self.focus_handle);
@@ -2854,9 +3216,9 @@ impl EditorView {
     /// the marker still begins inside the window.
     fn page_left(&self, bounds: Bounds<Pixels>) -> Pixels {
         let hang = self.layout.as_ref().map_or(0.0, Layout::max_hang);
-        let page = self
-            .last_page
-            .unwrap_or_else(|| page_for(bounds.size.width / px(1.0), self.layout_width.max(0.0)));
+        let page = self.last_page.unwrap_or_else(|| {
+            responsive_page_for(bounds.size.width / px(1.0), self.layout_width.max(0.0))
+        });
         bounds.left() + px(page.margin.max(hang))
     }
 
@@ -3074,6 +3436,22 @@ impl EditorView {
         cx.notify();
     }
 
+    fn reading_line_step(&mut self, lines: f32, cx: &mut Context<Self>) {
+        let step = LINE_HEIGHT_F32 * self.scale * 3.0;
+        let current = (-self.reading_scroll.offset().y / px(1.0)).max(0.0);
+        let max = self.reading_scroll.max_offset().y / px(1.0);
+        let target = (current + step * lines).clamp(0.0, max.max(0.0));
+        self.reading_scroll.set_offset(point(px(0.0), px(-target)));
+        cx.notify();
+    }
+
+    fn reading_edge(&mut self, to_end: bool, cx: &mut Context<Self>) {
+        let max = self.reading_scroll.max_offset().y / px(1.0);
+        let target = if to_end { max.max(0.0) } else { 0.0 };
+        self.reading_scroll.set_offset(point(px(0.0), px(-target)));
+        cx.notify();
+    }
+
     fn select_page_up(&mut self, _: &SelectPageUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_page(-1, true, window, cx);
     }
@@ -3171,6 +3549,9 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.reading {
+            return;
+        }
         let on_page = self.last_bounds.is_some_and(|bounds| {
             event.position.y >= bounds.top() + HEAD_PX && event.position.y <= bounds.bottom()
         });
@@ -3198,6 +3579,27 @@ impl EditorView {
             self.mouse_down_offset = None;
             return;
         };
+        if event.click_count == 1
+            && event.modifiers.secondary(cx)
+            && let Some(block) = self
+                .blocks
+                .get(block_index_for_offset(&self.blocks, offset))
+                .copied()
+            && block.kind != BlockKind::Code
+        {
+            let full = &self.buffer.text()[block.start..block.end];
+            let local = offset.saturating_sub(block.start);
+            if let Some(link) = inline::links(full)
+                .into_iter()
+                .find(|link| (link.text_start.saturating_sub(1)..link.next).contains(&local))
+            {
+                let url = full[link.url_start..link.url_end].trim();
+                if export::is_external_url(url) {
+                    cx.open_url(url);
+                    return;
+                }
+            }
+        }
 
         self.commit_composition(window);
         self.history.break_group();
@@ -3288,7 +3690,15 @@ impl EditorView {
         }
     }
 
+    pub(crate) fn max_scroll_for(&self, total: f32, viewport: f32) -> f32 {
+        let overscroll = if self.typewriter { viewport * 0.5 } else { 0.0 };
+        (total + overscroll - viewport).max(0.0)
+    }
+
     fn on_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.reading {
+            return;
+        }
         let Some(bounds) = self.last_bounds else {
             return;
         };
@@ -3298,7 +3708,8 @@ impl EditorView {
         let delta = event.delta.pixel_delta(LINE_HEIGHT * self.scale).y / px(1.0);
         let viewport = ((bounds.size.height - HEAD_PX) / px(1.0)).max(0.0);
         let total = self.estimated_total.max(layout.total());
-        self.scroll = (self.scroll + delta).clamp(0.0, (total - viewport).max(0.0));
+        let max_scroll = self.max_scroll_for(total, viewport);
+        self.scroll = (self.scroll - delta).clamp(0.0, max_scroll);
         // The wheel is an explicit request to leave the caret where it is.
         self.reveal_pending = false;
         cx.notify();
@@ -3316,8 +3727,12 @@ impl EditorView {
             return;
         };
         let viewport = ((bounds.size.height - HEAD_PX) / px(1.0)).max(0.0);
-        let total = layout.total();
-        let max_scroll = (total - viewport).max(0.0);
+        let total = self.estimated_total.max(layout.total());
+        let max_scroll = self.max_scroll_for(total, viewport);
+        if self.typewriter {
+            self.scroll = (y + h * 0.5 - viewport * 0.5).clamp(0.0, max_scroll);
+            return;
+        }
         if y < self.scroll {
             self.scroll = y;
         } else if y + h > self.scroll + viewport {
@@ -3477,6 +3892,14 @@ impl EditorView {
             cx.emit(EditorEvent::ModeChanged);
         }
         cx.notify();
+    }
+
+    pub fn restore_focus_scope(&mut self, scope: FocusScope, cx: &mut Context<Self>) {
+        if self.focus_scope != scope {
+            self.focus_scope = scope;
+            cx.emit(EditorEvent::ModeChanged);
+            cx.notify();
+        }
     }
 
     /// The last idle count of words, characters and reading time.
@@ -3858,12 +4281,16 @@ impl EditorView {
         };
         let viewport = ((bounds.size.height - HEAD_PX) / px(1.0)).max(0.0);
         let total = self.estimated_total.max(layout.total());
-        self.scroll = (self.scroll + delta_y).clamp(0.0, (total - viewport).max(0.0));
+        let max_scroll = self.max_scroll_for(total, viewport);
+        self.scroll = (self.scroll + delta_y).clamp(0.0, max_scroll);
         self.reveal_pending = false;
         true
     }
 
     fn offset_from_utf16(text: &str, offset: usize) -> usize {
+        if text.is_ascii() {
+            return offset.min(text.len());
+        }
         let mut utf16 = 0;
         for (byte, ch) in text.char_indices() {
             if utf16 >= offset {
@@ -3875,13 +4302,20 @@ impl EditorView {
     }
 
     fn offset_to_utf16(text: &str, offset: usize) -> usize {
+        if text.is_ascii() {
+            return offset.min(text.len());
+        }
         let offset = boundary_at_or_before(text, offset);
         text[..offset].encode_utf16().count()
     }
 
     fn byte_range_from_utf16(&self, range: Range<usize>) -> Range<usize> {
         let text = self.buffer.text();
-        let len = text.encode_utf16().count();
+        let len = if text.is_ascii() {
+            text.len()
+        } else {
+            text.encode_utf16().count()
+        };
         let start_byte = Self::offset_from_utf16(text, range.start.min(len));
         let end_byte = Self::offset_from_utf16(text, range.end.min(len));
         let mut start = grapheme_at_or_before(text, start_byte);
@@ -3895,6 +4329,45 @@ impl EditorView {
         }
         start..end
     }
+}
+
+pub(crate) fn adjust_spell_ranges(
+    ranges: &mut Vec<Range<usize>>,
+    edit_start: usize,
+    old_end: usize,
+    new_end: usize,
+) {
+    let delta = new_end as isize - old_end as isize;
+    ranges.retain_mut(|range| {
+        if range.end < edit_start {
+            true
+        } else if range.start > old_end {
+            range.start = (range.start as isize + delta).max(0) as usize;
+            range.end = (range.end as isize + delta).max(0) as usize;
+            range.start < range.end
+        } else {
+            false
+        }
+    });
+}
+
+fn map_caret_across_replacements(
+    caret: usize,
+    ranges: &[Range<usize>],
+    replacement_len: usize,
+) -> usize {
+    let mut delta: isize = 0;
+    for range in ranges {
+        if caret >= range.end {
+            delta += replacement_len as isize - (range.end - range.start) as isize;
+        } else if caret > range.start {
+            let mapped_start = (range.start as isize + delta).max(0) as usize;
+            return mapped_start + (caret - range.start).min(replacement_len);
+        } else {
+            break;
+        }
+    }
+    (caret as isize + delta).max(0) as usize
 }
 
 impl Focusable for EditorView {

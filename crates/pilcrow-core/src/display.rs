@@ -5,9 +5,25 @@
 //! delimiters, link URLs, heading hashes, quote marks, list markers and task
 //! boxes are presentation here; none of them are removed from the file.
 
+use std::ops::Range;
+
 use crate::blocks::{self, Kind};
-use crate::inline::{self, Kind as InlineKind};
+use crate::inline::{self, Kind as InlineKind, Link};
 use crate::lists;
+
+/// One styled range in [`DisplayBlock::text`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplaySpan {
+    pub range: Range<usize>,
+    pub kind: InlineKind,
+}
+
+/// One parsed `[text](url)` link range in [`DisplayBlock::text`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayLink {
+    pub range: Range<usize>,
+    pub url: String,
+}
 
 /// One block of the reading copy. `kind` keeps the page's block styling.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +31,10 @@ pub struct DisplayBlock {
     pub kind: Kind,
     pub level: u8,
     pub text: String,
+    /// Byte offset of this block in the source document, for scroll sync.
+    pub source_start: usize,
+    pub spans: Vec<DisplaySpan>,
+    pub links: Vec<DisplayLink>,
     /// List presentation, kept so HTML can preserve ordered lists and task
     /// state instead of flattening everything into bullets.
     pub ordered: bool,
@@ -41,6 +61,9 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
                 kind: Kind::Rule,
                 level: 0,
                 text: String::new(),
+                source_start: block.start,
+                spans: Vec::new(),
+                links: Vec::new(),
                 ordered: false,
                 number: 0,
                 depth: 0,
@@ -59,6 +82,9 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
                             kind: Kind::Code,
                             level: 0,
                             text: source.to_owned(),
+                            source_start: block.start,
+                            spans: Vec::new(),
+                            links: Vec::new(),
                             ordered: false,
                             number: 0,
                             depth: 0,
@@ -70,12 +96,15 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
             }
             Kind::Heading => {
                 let body = source.get(block.marker..).unwrap_or_default();
-                let text = join_soft_lines(&strip_inline(body));
+                let (text, spans, links) = extract_inline(body, 0);
                 if !text.is_empty() {
                     out.push(DisplayBlock {
                         kind: Kind::Heading,
                         level: block.level,
                         text,
+                        source_start: block.start,
+                        spans,
+                        links,
                         ordered: false,
                         number: 0,
                         depth: 0,
@@ -91,12 +120,15 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
                     .map(strip_quote_line)
                     .collect::<Vec<_>>()
                     .join("\n");
-                let text = join_soft_lines(&strip_inline(&body));
+                let (text, spans, links) = extract_inline(&body, 0);
                 if !text.is_empty() {
                     out.push(DisplayBlock {
                         kind: Kind::Quote,
                         level: 0,
                         text,
+                        source_start: block.start,
+                        spans,
+                        links,
                         ordered: false,
                         number: 0,
                         depth: 0,
@@ -107,7 +139,6 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
             Kind::ListItem => {
                 if let Some(item) = lists::parse(source.as_bytes()) {
                     let body = source.get(item.marker_end..).unwrap_or_default();
-                    let body = join_soft_lines(&strip_inline(body));
                     let indent = " ".repeat(item.indent);
                     let marker = if item.task {
                         if item.checked { "☑ " } else { "☐ " }
@@ -121,10 +152,15 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
                     } else {
                         String::new()
                     };
+                    let prefix = format!("{indent}{number}{marker}");
+                    let (body_text, spans, links) = extract_inline(body, prefix.len());
                     out.push(DisplayBlock {
                         kind: Kind::ListItem,
                         level: 0,
-                        text: format!("{indent}{number}{marker}{body}"),
+                        text: format!("{prefix}{body_text}"),
+                        source_start: block.start,
+                        spans,
+                        links,
                         ordered: item.ordered,
                         number: item.number,
                         depth: item.indent / 2,
@@ -133,12 +169,15 @@ pub fn blocks(text: &str) -> Vec<DisplayBlock> {
                 }
             }
             Kind::Paragraph => {
-                let text = join_soft_lines(&strip_inline(source));
+                let (text, spans, links) = extract_inline(source, 0);
                 if !text.is_empty() {
                     out.push(DisplayBlock {
                         kind: Kind::Paragraph,
                         level: 0,
                         text,
+                        source_start: block.start,
+                        spans,
+                        links,
                         ordered: false,
                         number: 0,
                         depth: 0,
@@ -159,28 +198,79 @@ fn strip_quote_line(line: &str) -> &str {
     rest.strip_prefix(' ').unwrap_or(rest)
 }
 
-fn join_soft_lines(text: &str) -> String {
-    text.split('\n')
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+/// Remove inline syntax while preserving styled byte spans and link metadata.
+fn extract_inline(raw: &str, base_offset: usize) -> (String, Vec<DisplaySpan>, Vec<DisplayLink>) {
+    let source = raw.trim();
+    if source.is_empty() {
+        return (String::new(), Vec::new(), Vec::new());
+    }
+    let mut kinds = vec![InlineKind::Plain; source.len()];
+    inline::kinds(source, &mut kinds);
+    let links: Vec<Link> = if source.as_bytes().contains(&b'[') {
+        inline::links(source)
+            .into_iter()
+            .filter(|link| {
+                link.next <= source.len()
+                    && link.text_start < link.text_end
+                    && kinds.get(link.text_start.saturating_sub(1)) == Some(&InlineKind::Marker)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let soft = crate::export::soft_break_map(source);
 
-/// Remove inline syntax while keeping every word and character of prose.
-fn strip_inline(text: &str) -> String {
-    let mut kinds = vec![InlineKind::Plain; text.len()];
-    inline::kinds(text, &mut kinds);
-    let mut out = String::with_capacity(text.len());
+    let mut out = String::with_capacity(source.len());
+    let mut spans: Vec<DisplaySpan> = Vec::new();
+    let mut out_links: Vec<DisplayLink> = Vec::new();
+    let mut active_link: Option<(usize, Range<usize>, String)> = None;
+    let mut link_idx = 0usize;
     let mut escaped = false;
-    for (index, ch) in text.char_indices() {
-        if escaped {
-            out.push(ch);
+
+    for (index, ch) in source.char_indices() {
+        let mark = soft.get(index).copied().unwrap_or(0);
+        if mark == 1 {
             escaped = false;
             continue;
         }
-        if ch == '\\'
-            && text[index + 1..]
+        while link_idx < links.len() && links[link_idx].next <= index {
+            link_idx += 1;
+        }
+        let in_link = links
+            .get(link_idx)
+            .filter(|link| (link.text_start..link.text_end).contains(&index))
+            .map(|link| (link_idx, source[link.url_start..link.url_end].trim()));
+
+        if mark == 2 {
+            escaped = false;
+            let start = base_offset + out.len();
+            out.push(' ');
+            let end = base_offset + out.len();
+            if let Some((idx, url)) = in_link {
+                extend_link(&mut active_link, &mut out_links, idx, start..end, url);
+            } else if let Some((_, range, url)) = active_link.take() {
+                out_links.push(DisplayLink { range, url });
+            }
+            continue;
+        }
+
+        let kind = kinds[index];
+        if escaped {
+            escaped = false;
+            let start = base_offset + out.len();
+            out.push(ch);
+            let end = base_offset + out.len();
+            push_span(&mut spans, kind, start..end);
+            if let Some((idx, url)) = in_link {
+                extend_link(&mut active_link, &mut out_links, idx, start..end, url);
+            } else if let Some((_, range, url)) = active_link.take() {
+                out_links.push(DisplayLink { range, url });
+            }
+            continue;
+        }
+        if kind != InlineKind::Code
+            && ch == '\\'
+            && source[index + 1..]
                 .chars()
                 .next()
                 .is_some_and(|next| next.is_ascii_punctuation())
@@ -188,12 +278,67 @@ fn strip_inline(text: &str) -> String {
             escaped = true;
             continue;
         }
-        if kinds[index] == InlineKind::Marker {
+        if kind == InlineKind::Marker {
+            if let Some((_, range, url)) = active_link.take() {
+                out_links.push(DisplayLink { range, url });
+            }
             continue;
         }
+
+        let start = base_offset + out.len();
         out.push(ch);
+        let end = base_offset + out.len();
+        push_span(&mut spans, kind, start..end);
+        if let Some((idx, url)) = in_link {
+            extend_link(&mut active_link, &mut out_links, idx, start..end, url);
+        } else if let Some((_, range, url)) = active_link.take() {
+            out_links.push(DisplayLink { range, url });
+        }
     }
-    out
+    if let Some((_, range, url)) = active_link {
+        out_links.push(DisplayLink { range, url });
+    }
+    (out, spans, out_links)
+}
+
+fn push_span(spans: &mut Vec<DisplaySpan>, kind: InlineKind, range: Range<usize>) {
+    if !matches!(
+        kind,
+        InlineKind::Bold | InlineKind::Italic | InlineKind::Strike | InlineKind::Code
+    ) {
+        return;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.kind == kind
+        && last.range.end == range.start
+    {
+        last.range.end = range.end;
+    } else {
+        spans.push(DisplaySpan { range, kind });
+    }
+}
+
+fn extend_link(
+    active: &mut Option<(usize, Range<usize>, String)>,
+    out: &mut Vec<DisplayLink>,
+    idx: usize,
+    range: Range<usize>,
+    url: &str,
+) {
+    if let Some((cur_idx, cur_range, _)) = active.as_mut()
+        && *cur_idx == idx
+        && cur_range.end == range.start
+    {
+        cur_range.end = range.end;
+        return;
+    }
+    if let Some((_, prev_range, prev_url)) = active.take() {
+        out.push(DisplayLink {
+            range: prev_range,
+            url: prev_url,
+        });
+    }
+    *active = Some((idx, range, url.to_owned()));
 }
 
 #[cfg(test)]
@@ -270,5 +415,37 @@ mod tests {
     fn escaped_punctuation_is_plain_prose() {
         let out = rendered(r"a \*literal\* star");
         assert_eq!(out, vec![(Kind::Paragraph, "a *literal* star".into())]);
+    }
+
+    #[test]
+    fn spans_and_links_record_exact_offsets_in_reading_copy() {
+        let text =
+            "- [ ] Buy **milk** and `oat` from [Store](https://shop.test)\n\nPara ~~old~~ *new*.";
+        let out = blocks(text);
+        assert_eq!(out.len(), 2);
+
+        let item = &out[0];
+        assert_eq!(item.text, "☐ Buy milk and oat from Store");
+        assert_eq!(item.source_start, 0);
+        assert_eq!(
+            item.spans
+                .iter()
+                .map(|s| (s.kind, &item.text[s.range.clone()]))
+                .collect::<Vec<_>>(),
+            vec![(InlineKind::Bold, "milk"), (InlineKind::Code, "oat")]
+        );
+        assert_eq!(item.links.len(), 1);
+        assert_eq!(&item.text[item.links[0].range.clone()], "Store");
+        assert_eq!(item.links[0].url, "https://shop.test");
+
+        let para = &out[1];
+        assert_eq!(para.text, "Para old new.");
+        assert_eq!(
+            para.spans
+                .iter()
+                .map(|s| (s.kind, &para.text[s.range.clone()]))
+                .collect::<Vec<_>>(),
+            vec![(InlineKind::Strike, "old"), (InlineKind::Italic, "new")]
+        );
     }
 }

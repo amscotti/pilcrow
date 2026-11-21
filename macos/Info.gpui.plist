@@ -41,12 +41,20 @@
             <array>
                 <string>md</string>
                 <string>markdown</string>
+                <string>mdown</string>
+                <string>mkd</string>
+                <string>txt</string>
+                <string>text</string>
             </array>
             <key>LSItemContentTypes</key>
             <array>
+                <string>public.markdown</string>
                 <string>net.daringfireball.markdown</string>
+                <string>public.plain-text</string>
             </array>
         </dict>
     </array>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © Pilcrow contributors. MIT License.</string>
 </dict>
 </plist>

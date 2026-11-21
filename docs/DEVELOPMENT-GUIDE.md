@@ -261,8 +261,8 @@ or run **Release** manually with a tag. It publishes unsigned:
 | `PILCROW_E2E_A11Y` | opt in to the xa11y gate |
 | `PILCROW_RECOVERY_CLIPBOARD` | opt in to last-resort clipboard recovery |
 
-App data is under `PilcrowNext` (`~/Library/Application Support/PilcrowNext` on
-macOS, `~/.local/share/pilcrow-next` on Linux, `%APPDATA%\PilcrowNext` on
+App data is under `Pilcrow` (`~/Library/Application Support/Pilcrow` on
+macOS, `~/.local/share/pilcrow` on Linux, `%APPDATA%\Pilcrow` on
 Windows). `settings.json`, `session.json`, `drafts/`, `backups/`, and
 `recovery/` live there. Never point a test at the real root.
 

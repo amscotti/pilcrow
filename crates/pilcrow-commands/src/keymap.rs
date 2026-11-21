@@ -87,7 +87,9 @@ pub fn install_editor_keybindings_for(cx: &mut App, platform: Platform) {
         KeyBinding::new("backspace", Backspace, Some("Editor")),
         KeyBinding::new("delete", Delete, Some("Editor")),
         KeyBinding::new("enter", InsertNewline, Some("Editor")),
+        KeyBinding::new("shift-enter", ShiftEnter, Some("Editor")),
         KeyBinding::new("tab", InsertTab, Some("Editor")),
+        KeyBinding::new("shift-tab", SwitchFindField, Some("Editor")),
         KeyBinding::new("left", Left, Some("Editor")),
         KeyBinding::new("right", Right, Some("Editor")),
         KeyBinding::new("up", Up, Some("Editor")),
@@ -209,29 +211,43 @@ pub fn install_app_keybindings_for(cx: &mut App, platform: Platform) {
         Platform::MacOs => ("cmd-n", "cmd-o", "cmd-s", "cmd-shift-s", "cmd-alt-a"),
         Platform::Other => ("ctrl-n", "ctrl-o", "ctrl-s", "ctrl-shift-s", "ctrl-alt-a"),
     };
-    let (quit, close, next_note, previous_note, size_up, size_up_plus, size_down, size_reset) =
-        match platform {
-            Platform::MacOs => (
-                "cmd-q",
-                "cmd-w",
-                "cmd-`",
-                "cmd-shift-`",
-                "cmd-=",
-                "cmd-+",
-                "cmd--",
-                "cmd-0",
-            ),
-            Platform::Other => (
-                "ctrl-q",
-                "ctrl-w",
-                "ctrl-`",
-                "ctrl-shift-`",
-                "ctrl-=",
-                "ctrl-+",
-                "ctrl--",
-                "ctrl-0",
-            ),
-        };
+    let (
+        quit,
+        close,
+        next_note,
+        previous_note,
+        size_up,
+        size_up_plus,
+        size_down,
+        size_reset,
+        palette,
+        versions,
+    ) = match platform {
+        Platform::MacOs => (
+            "cmd-q",
+            "cmd-w",
+            "cmd-`",
+            "cmd-shift-`",
+            "cmd-=",
+            "cmd-+",
+            "cmd--",
+            "cmd-0",
+            "cmd-shift-p",
+            "cmd-alt-v",
+        ),
+        Platform::Other => (
+            "ctrl-q",
+            "ctrl-w",
+            "ctrl-`",
+            "ctrl-shift-`",
+            "ctrl-=",
+            "ctrl-+",
+            "ctrl--",
+            "ctrl-0",
+            "ctrl-shift-p",
+            "ctrl-alt-v",
+        ),
+    };
 
     cx.bind_keys([
         KeyBinding::new(new_note, NewNote, Some("NoteWindow")),
@@ -247,6 +263,15 @@ pub fn install_app_keybindings_for(cx: &mut App, platform: Platform) {
         KeyBinding::new(size_up_plus, TextSizeUp, Some("NoteWindow")),
         KeyBinding::new(size_down, TextSizeDown, Some("NoteWindow")),
         KeyBinding::new(size_reset, TextSizeReset, Some("NoteWindow")),
+        KeyBinding::new(palette, ToggleCommandPalette, Some("NoteWindow")),
+        KeyBinding::new(versions, BrowseVersions, Some("NoteWindow")),
     ]);
+    if platform == Platform::MacOs {
+        cx.bind_keys([
+            KeyBinding::new("cmd-n", NewNote, None),
+            KeyBinding::new("cmd-o", Open, None),
+            KeyBinding::new("cmd-q", QuitApp, None),
+        ]);
+    }
     install_editor_keybindings_for(cx, platform);
 }

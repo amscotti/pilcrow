@@ -249,7 +249,7 @@ fn filter_prose(text: &str, blocks: &[Block], ranges: Vec<Range<usize>>) -> Vec<
         let overlaps_marker = (start..end).any(|byte| {
             kinds
                 .get(byte.saturating_sub(block.start))
-                .is_some_and(|kind| *kind == InlineKind::Marker)
+                .is_some_and(|kind| matches!(*kind, InlineKind::Marker | InlineKind::Code))
         });
         if !overlaps_marker {
             out.push(start..end);
@@ -271,20 +271,27 @@ mod tests {
 
     #[test]
     fn filters_code_markers_and_urls_from_platform_ranges() {
-        let text = "One **bold** [site](https://example.com)\n\n```\nteh code\n```";
+        let text = "One **bold** `tehspan` [site](https://example.com)\n\n```\nteh code\n```";
         let all_blocks = blocks(text);
         let bold = text.find("bold").expect("bold");
+        let inline_code = text.find("tehspan").expect("inline code");
         let url = text.find("example").expect("url");
-        let code = text.find("teh").expect("code");
+        let code = text.find("teh code").expect("code");
         let kept = filter_prose(
             text,
             &all_blocks,
-            vec![0..3, bold..bold + 4, url..url + 7, code..code + 3],
+            vec![
+                0..3,
+                bold..bold + 4,
+                inline_code..inline_code + 7,
+                url..url + 7,
+                code..code + 3,
+            ],
         );
         assert_eq!(
             kept,
             vec![0..3, bold..bold + 4],
-            "prose and emphasised words should survive"
+            "prose and emphasised words should survive while inline code, URLs, and code blocks are filtered"
         );
     }
 
