@@ -115,6 +115,9 @@ jobs:
           key: release-windows-${{ hashFiles('Cargo.lock') }}
       - name: Build
         run: cargo build -p pilcrow-app --release --locked
+      - name: Verify static CRT
+        shell: pwsh
+        run: "& scripts/check-windows-crt.ps1 -BinaryPath target/release/pilcrow.exe"
       - name: Package
         shell: pwsh
         env:

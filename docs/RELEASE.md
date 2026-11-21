@@ -93,6 +93,11 @@ project.
 cargo build -p pilcrow-app --release --locked
 ```
 
+`.cargo/config.toml` enables `-C target-feature=+crt-static` for Windows MSVC
+targets so `pilcrow.exe` links the MSVC C runtime statically and runs on fresh
+Windows installs without requiring the Visual C++ Redistributable. CI and
+release builds verify the PE import table with `scripts/check-windows-crt.ps1`.
+
 Package `target/release/pilcrow.exe` as a portable `.zip`. SmartScreen may warn
 on download; document it. Do not add a signing step until Windows is promoted
 beyond best effort.

@@ -174,3 +174,8 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: Check test-driver feature
         run: cargo check -p pilcrow-app --all-targets --features test-driver --locked
+      - name: Build binary and verify static CRT
+        shell: pwsh
+        run: |
+          cargo build -p pilcrow-app --locked
+          & scripts/check-windows-crt.ps1 -BinaryPath target/debug/pilcrow.exe
