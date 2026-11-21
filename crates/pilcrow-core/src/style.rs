@@ -116,7 +116,7 @@ pub fn look(block: Block) -> Look {
             bold: false,
             indent: 0.0,
             gap: 14.0,
-            gap_before: 0.0,
+            gap_before: 14.0,
             is_rule: true,
         },
         Kind::Frontmatter => Look {

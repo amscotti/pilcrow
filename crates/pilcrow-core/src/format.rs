@@ -60,13 +60,12 @@ pub fn command(
     caret: usize,
     command: Command,
 ) -> Option<FormatEdit> {
-    let len = text.len();
-    let mut from = from.min(len);
-    let mut to = to.min(len);
+    let mut from = crate::buffer::boundary_at_or_before(text, from);
+    let mut to = crate::buffer::boundary_at_or_before(text, to);
     if from > to {
         std::mem::swap(&mut from, &mut to);
     }
-    let caret = caret.min(len);
+    let caret = crate::buffer::boundary_at_or_before(text, caret);
     let reverse = from != to && caret == from;
     let mut edit = match command {
         Command::Bold => wrap(text, from, to, caret, "**", "**"),
@@ -822,5 +821,31 @@ mod tests {
         assert_eq!(e.range, 10..10);
         assert_eq!(e.replacement, "****");
         assert_eq!(e.after, Placement::Caret(12));
+    }
+
+    #[test]
+    fn mid_codepoint_offsets_snap_without_panicking() {
+        let text = "日本語";
+        for cmd in [
+            Command::Bold,
+            Command::Italic,
+            Command::Link,
+            Command::Heading(1),
+        ] {
+            let result = command(text, 1, 5, 2, cmd);
+            if let Some(edit) = result {
+                assert!(text.is_char_boundary(edit.range.start));
+                assert!(text.is_char_boundary(edit.range.end));
+                let mut updated = text.to_owned();
+                updated.replace_range(edit.range.clone(), &edit.replacement);
+                match edit.after {
+                    Placement::Caret(at) => assert!(updated.is_char_boundary(at)),
+                    Placement::Selection { anchor, caret } => {
+                        assert!(updated.is_char_boundary(anchor));
+                        assert!(updated.is_char_boundary(caret));
+                    }
+                }
+            }
+        }
     }
 }

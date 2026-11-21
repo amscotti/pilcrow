@@ -46,6 +46,21 @@ fn to_u32(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
+fn quote_prefix_len(line: &[u8]) -> usize {
+    let mut i = 0;
+    while i < line.len() && i < 3 && line[i] == b' ' {
+        i += 1;
+    }
+    if line.get(i) != Some(&b'>') {
+        return 0;
+    }
+    i += 1;
+    if line.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    i
+}
+
 /// Marker hangs wider than this are a broken measurer, not a heading. It is
 /// far more than the widest `###### ` at 28pt.
 const MAX_HANG: f32 = 256.0;
@@ -266,26 +281,182 @@ impl Layout {
                 }
             }
 
-            // Inside a code block an asterisk is an asterisk, and one source
-            // line is already one visual line: a long code line is not
-            // reflowed into prose.
+            // Inside a code block an asterisk is an asterisk. Long code lines
+            // wrap cleanly to the page column so text never clips past the edge.
             if b.kind == BlockKind::Code {
+                let code_face = MeasureStyle {
+                    size: look.size,
+                    bold: false,
+                    italic: false,
+                    mono: true,
+                };
                 let h = style::line_height(look);
-                self.lines.push(Placed {
-                    block: to_u32(bi),
-                    start: 0,
-                    end: to_u32(segment.len()),
-                    x: look.indent,
-                    y,
-                    h,
-                    rule: false,
-                });
-                y += h + look.gap;
+                wrap::wrap_into(
+                    m,
+                    segment,
+                    None,
+                    code_face,
+                    self.width - look.indent,
+                    0.0,
+                    &mut self.scratch,
+                );
+                for line in &self.scratch {
+                    self.lines.push(Placed {
+                        block: to_u32(bi),
+                        start: to_u32(line.start),
+                        end: to_u32(line.end),
+                        x: look.indent,
+                        y,
+                        h,
+                        rule: false,
+                    });
+                    y += h;
+                }
+                y += look.gap;
                 continue;
             }
 
             self.kinds_buf.resize(segment.len(), InlineKind::Plain);
             inline::kinds(segment, &mut self.kinds_buf);
+            let h = style::line_height(look);
+
+            if b.kind == BlockKind::Quote {
+                let mut last_quote_hang = 0.0;
+                let bytes = segment.as_bytes();
+                let mut sub_start = 0;
+                loop {
+                    let nl = bytes[sub_start..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map(|offset| sub_start + offset);
+                    let raw_end = nl.unwrap_or(bytes.len());
+                    let sub_end =
+                        if nl.is_some() && raw_end > sub_start && bytes[raw_end - 1] == b'\r' {
+                            raw_end - 1
+                        } else {
+                            raw_end
+                        };
+                    let sub = &segment[sub_start..sub_end];
+                    let prefix = quote_prefix_len(sub.as_bytes());
+                    if prefix > 0 {
+                        let quote_hang = sanitize_width(m.width(&sub[..prefix], face));
+                        last_quote_hang = quote_hang;
+                        wrap::wrap_into(
+                            m,
+                            sub,
+                            Some(&self.kinds_buf[sub_start..sub_end]),
+                            face,
+                            self.width - look.indent,
+                            quote_hang,
+                            &mut self.scratch,
+                        );
+                        for (nth, line) in self.scratch.iter().enumerate() {
+                            let x = if nth == 0 {
+                                look.indent
+                            } else {
+                                look.indent + quote_hang
+                            };
+                            self.lines.push(Placed {
+                                block: to_u32(bi),
+                                start: to_u32(sub_start + line.start),
+                                end: to_u32(sub_start + line.end),
+                                x,
+                                y,
+                                h,
+                                rule: false,
+                            });
+                            y += h;
+                        }
+                    } else {
+                        let avail = (self.width - look.indent - last_quote_hang).max(1.0);
+                        wrap::wrap_into(
+                            m,
+                            sub,
+                            Some(&self.kinds_buf[sub_start..sub_end]),
+                            face,
+                            avail,
+                            0.0,
+                            &mut self.scratch,
+                        );
+                        for line in &self.scratch {
+                            self.lines.push(Placed {
+                                block: to_u32(bi),
+                                start: to_u32(sub_start + line.start),
+                                end: to_u32(sub_start + line.end),
+                                x: look.indent + last_quote_hang,
+                                y,
+                                h,
+                                rule: false,
+                            });
+                            y += h;
+                        }
+                    }
+                    let Some(nl_at) = nl else {
+                        break;
+                    };
+                    sub_start = nl_at + 1;
+                    if sub_start >= bytes.len() {
+                        break;
+                    }
+                }
+                y += look.gap;
+                continue;
+            }
+
+            if b.kind == BlockKind::ListItem && segment.contains('\n') {
+                let bytes = segment.as_bytes();
+                let mut sub_start = 0;
+                loop {
+                    let nl = bytes[sub_start..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map(|offset| sub_start + offset);
+                    let raw_end = nl.unwrap_or(bytes.len());
+                    let sub_end =
+                        if nl.is_some() && raw_end > sub_start && bytes[raw_end - 1] == b'\r' {
+                            raw_end - 1
+                        } else {
+                            raw_end
+                        };
+                    let sub = &segment[sub_start..sub_end];
+                    wrap::wrap_into(
+                        m,
+                        sub,
+                        Some(&self.kinds_buf[sub_start..sub_end]),
+                        face,
+                        self.width - look.indent,
+                        list_hang,
+                        &mut self.scratch,
+                    );
+                    for (nth, line) in self.scratch.iter().enumerate() {
+                        let x = if nth == 0 {
+                            look.indent
+                        } else {
+                            look.indent + list_hang
+                        };
+                        self.lines.push(Placed {
+                            block: to_u32(bi),
+                            start: to_u32(sub_start + line.start),
+                            end: to_u32(sub_start + line.end),
+                            x,
+                            y,
+                            h,
+                            rule: false,
+                        });
+                        y += h;
+                    }
+                    let Some(nl_at) = nl else {
+                        break;
+                    };
+                    sub_start = nl_at + 1;
+                    if sub_start >= bytes.len() {
+                        break;
+                    }
+                }
+                y += look.gap;
+                continue;
+            }
+
             wrap::wrap_into(
                 m,
                 segment,
@@ -296,7 +467,6 @@ impl Layout {
                 &mut self.scratch,
             );
 
-            let h = style::line_height(look);
             for (nth, line) in self.scratch.iter().enumerate() {
                 let x = if nth == 0 {
                     look.indent - hang
@@ -463,7 +633,12 @@ impl Layout {
         let Some(b) = blocks.get(block).copied() else {
             return false;
         };
-        if matches!(b.kind, BlockKind::Blank | BlockKind::Rule | BlockKind::Code) {
+        let segment = &text[b.start..b.end];
+        if matches!(
+            b.kind,
+            BlockKind::Blank | BlockKind::Rule | BlockKind::Code | BlockKind::Quote
+        ) || (b.kind == BlockKind::ListItem && segment.contains('\n'))
+        {
             return false;
         }
         let first = self
@@ -474,7 +649,6 @@ impl Layout {
             .take_while(|line| line.block as usize == block)
             .count();
         let look = style::look_scaled(b, self.scale);
-        let segment = &text[b.start..b.end];
         let from = from.min(segment.len());
         let face = MeasureStyle {
             size: look.size,
@@ -722,9 +896,6 @@ impl Layout {
             return look.gap_before + look.gap;
         }
         let h = style::line_height(look);
-        if block.kind == BlockKind::Code {
-            return look.gap_before + h + look.gap;
-        }
         let bytes = block.end.saturating_sub(block.start) as f32;
         let per_byte = self.width_per_byte(m, look);
         let avail = (self.width - look.indent).max(1.0);
@@ -1032,29 +1203,31 @@ mod tests {
         let layout = build(text, &blocks, 120.0);
         let lines = layout.lines();
         assert!(lines.len() > 1);
-        for line in lines {
-            assert_eq!(line.x, 18.0);
+        assert_eq!(lines[0].x, 18.0);
+        for line in &lines[1..] {
+            assert!(
+                line.x > 18.0,
+                "quote continuation line did not hang past `> `"
+            );
         }
     }
 
     #[test]
-    fn code_is_one_placed_line_per_source_line() {
-        let text = "```\nlet x = a very long line that does not wrap even here\n```";
+    fn code_wraps_long_lines_to_column() {
+        let text = "```\nlet x = a very long line that wraps within the column cleanly\n```";
         let blocks = scan(text);
         assert_eq!(blocks.iter().filter(|b| b.kind == Kind::Code).count(), 3);
-        let layout = build(text, &blocks, 40.0);
+        let layout = build(text, &blocks, 120.0);
         let lines = layout.lines();
-        assert_eq!(lines.len(), 3, "a long code line is not reflowed");
-        for (index, line) in lines.iter().enumerate() {
-            assert_eq!(line.block, index as u32);
-            let block = blocks[index];
-            assert_eq!(line.start, 0);
-            assert_eq!(line.end as usize, block.end - block.start);
+        assert!(
+            lines.len() > 3,
+            "a long code line should wrap inside column"
+        );
+        for line in lines {
             assert_eq!(line.x, 0.0);
             assert!(close(line.h, 16.0 * 0.92 * 1.6));
             assert!(!line.rule);
         }
-        assert!(close(layout.total(), 3.0 * 14.72 * 1.6));
     }
 
     #[test]
@@ -1068,8 +1241,8 @@ mod tests {
         assert!(lines[0].rule);
         assert_eq!((lines[0].start, lines[0].end), (0, 0));
         assert!(close(lines[0].h, 1.0));
-        assert!(close(lines[0].y, 0.0));
-        assert!(close(layout.total(), 15.0));
+        assert!(close(lines[0].y, 14.0));
+        assert!(close(layout.total(), 29.0));
     }
 
     #[test]
@@ -1173,7 +1346,6 @@ mod tests {
                     assert_eq!(rules.len(), 1);
                     assert!(rules[0].rule);
                 }
-                Kind::Code => assert_eq!(lines.count(), 1),
                 _ => {
                     assert!(lines.count() >= 1, "block {index} has no placed line");
                     for (at, byte) in segment.bytes().enumerate() {
@@ -1651,7 +1823,10 @@ mod tests {
             .find(|line| line.block as usize == rule)
             .unwrap();
         assert!(rule_line.rule);
-        assert!(close(rule_line.y, rule_top));
+        assert!(close(
+            rule_line.y,
+            rule_top + crate::style::look(blocks[rule]).gap_before
+        ));
 
         let last = blocks.len() - 1;
         assert_eq!(blocks[last].kind, Kind::Blank);

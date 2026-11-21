@@ -186,28 +186,28 @@ fn data_root_from(override_dir: Option<std::ffi::OsString>) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME")
         && !home.is_empty()
     {
-        return PathBuf::from(home).join("Library/Application Support/PilcrowNext");
+        return PathBuf::from(home).join("Library/Application Support/Pilcrow");
     }
     #[cfg(target_os = "windows")]
     if let Some(appdata) = std::env::var_os("APPDATA")
         && !appdata.is_empty()
     {
-        return PathBuf::from(appdata).join("PilcrowNext");
+        return PathBuf::from(appdata).join("Pilcrow");
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Some(data) = std::env::var_os("XDG_DATA_HOME")
             && !data.is_empty()
         {
-            return PathBuf::from(data).join("pilcrow-next");
+            return PathBuf::from(data).join("pilcrow");
         }
         if let Some(home) = std::env::var_os("HOME")
             && !home.is_empty()
         {
-            return PathBuf::from(home).join(".local/share/pilcrow-next");
+            return PathBuf::from(home).join(".local/share/pilcrow");
         }
     }
-    std::env::temp_dir().join("pilcrow-next")
+    std::env::temp_dir().join("pilcrow")
 }
 
 pub fn prefs_path() -> PathBuf {
@@ -420,5 +420,21 @@ mod tests {
     #[should_panic(expected = "PILCROW_DATA_DIR is set but empty")]
     fn an_empty_data_override_is_an_error() {
         let _ = data_root_from(Some(std::ffi::OsString::new()));
+    }
+
+    #[test]
+    fn normalized_data_root_uses_pilcrow_name() {
+        let custom = PathBuf::from("/tmp/pilcrow-custom");
+        assert_eq!(data_root_from(Some(custom.clone().into())), custom);
+        let default = data_root_from(None);
+        let leaf = default
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("data root leaf");
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert!(matches!(leaf, "Pilcrow" | "pilcrow"));
+        } else {
+            assert_eq!(leaf, "pilcrow");
+        }
     }
 }

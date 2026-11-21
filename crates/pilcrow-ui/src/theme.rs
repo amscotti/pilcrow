@@ -67,12 +67,12 @@ pub fn light_high_contrast() -> Tokens {
         paper: hex(0xFFFFFF),
         ink: hex(0x000000),
         mid: hex(0x2D2D2D),
-        dim: hex(0x545454),
+        dim: hex(0x454545),
         rule: hex(0x767676),
         accent: hex(0x002FA3),
         selection: hex(0xB9D2FF),
         code_bg: hex(0xE8E8E8),
-        spell: hex(0xA60000),
+        spell: hex(0x8A0000),
     }
 }
 
@@ -149,6 +149,18 @@ mod tests {
             ] {
                 let ratio = contrast_ratio(color, tokens.paper);
                 assert!(ratio >= 7.0, "{name} {role} contrast was {ratio:.2}:1");
+            }
+            for (role, color) in [
+                ("ink", tokens.ink),
+                ("mid", tokens.mid),
+                ("dim", tokens.dim),
+                ("spell", tokens.spell),
+            ] {
+                let ratio = contrast_ratio(color, tokens.code_bg);
+                assert!(
+                    ratio >= 7.0,
+                    "{name} {role} on code_bg contrast was {ratio:.2}:1"
+                );
             }
         }
     }

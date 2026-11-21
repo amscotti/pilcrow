@@ -50,10 +50,10 @@ prove the real app through a real window.
 
 Current local baseline:
 
-- **495 Rust tests** pass across the workspace.
+- **506 Rust tests** pass across the workspace (**508** with `test-driver`).
 - **12 Python E2E tests** (5 smoke, 2 transport, 2 trace, 2 crash/recovery,
   1 accessibility).
-- **87.03% line coverage** overall, above the 85% gate.
+- **87.30% line coverage** overall, above the 85% gate.
 - Clippy and formatting are clean.
 
 ---
@@ -134,10 +134,10 @@ does not need a platform window.
 - conflict banners and explicit overwrite;
 - session restore, recent files, and window registry reservations;
 - rolling backups and prefs round-trip;
-- menu installation, keybinding dispatch, app identity;
+- menu installation, command palette dispatch, Browse Versions restore, keybinding dispatch, app identity;
 - Save As and export destination selection.
 
-Tests must never point at the developer's real `PilcrowNext` root. Use
+Tests must never point at the developer's real `Pilcrow` root. Use
 `PILCROW_DATA_DIR` or an injected temporary root.
 
 ### 4.4 Driver protocol tests

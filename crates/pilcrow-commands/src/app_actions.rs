@@ -31,6 +31,8 @@ actions!(
         MeasureNarrow,
         MeasureStandard,
         MeasureWide,
+        ToggleCommandPalette,
+        BrowseVersions,
     ]
 );
 

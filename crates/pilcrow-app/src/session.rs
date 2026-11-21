@@ -52,6 +52,7 @@ pub struct SavedWindow {
     pub scroll: f32,
     pub reading: bool,
     pub focus: bool,
+    pub focus_sentence: bool,
     pub typewriter: bool,
     /// Where the window was. `None` in sessions written before frames were
     /// recorded.
@@ -230,6 +231,7 @@ mod tests {
                     scroll: 12.5,
                     reading: true,
                     focus: false,
+                    focus_sentence: false,
                     typewriter: true,
                     frame: Some(SavedFrame {
                         x: 40.0,

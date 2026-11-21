@@ -22,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gpui::prelude::*;
 use gpui::{
     AnyWindowHandle, App, Bounds, ClickEvent, ClipboardItem, Context, Entity, ExternalPaths,
-    Focusable, Global, QuitMode, Render, Subscription, Task, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, point, px, size,
+    Focusable, Global, MouseMoveEvent, QuitMode, Render, Role, Subscription, Task, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowHandle, WindowOptions, div, point, px, size,
 };
 use pilcrow_commands::app_actions::*;
 use pilcrow_commands::keymap::{self, Platform};
@@ -39,8 +39,11 @@ use registry::{
 use save::{ActiveSave, SaveFailure, SaveGuard, SaveRequest, SaveState};
 
 static RECOVERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(test))]
 static PREFERENCES_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(test))]
+static PREFERENCES_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub mod app_identity;
 pub mod backups;
@@ -49,6 +52,7 @@ mod ffi;
 pub mod file;
 #[cfg(feature = "goldens")]
 pub mod goldens;
+mod overlays;
 pub mod prefs;
 pub mod registry;
 pub mod save;
@@ -132,12 +136,21 @@ fn sync_note_tokens(cx: &mut App) {
     }
 }
 
+fn sync_platform_appearance(cx: &App, appearance: prefs::Appearance) {
+    cx.set_window_appearance(match appearance {
+        prefs::Appearance::Auto => None,
+        prefs::Appearance::Light => Some(WindowAppearance::Light),
+        prefs::Appearance::Dark => Some(WindowAppearance::Dark),
+    });
+}
+
 fn set_prefs(cx: &mut App, next: Preferences) {
     if cx.try_global::<Preferences>().is_none() {
         cx.set_global(next);
     } else {
         cx.update_global::<Preferences, _>(|prefs, _| *prefs = next);
     }
+    sync_platform_appearance(cx, next.appearance);
     cx.refresh_windows();
     sync_note_tokens(cx);
     install_menus(cx);
@@ -149,6 +162,8 @@ fn set_prefs(cx: &mut App, next: Preferences) {
             measure: next.measure,
             contrast: next.contrast,
         };
+        let settings_path = app_data_root(cx).join("settings.json");
+        PREFERENCES_DIRTY.store(true, Ordering::Relaxed);
         let generation = PREFERENCES_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
         let executor = cx.background_executor().clone();
         cx.background_executor()
@@ -158,8 +173,10 @@ fn set_prefs(cx: &mut App, next: Preferences) {
                 if PREFERENCES_GENERATION.load(Ordering::Relaxed) != generation {
                     return;
                 }
-                if let Err(error) = prefs::save(saved) {
+                if let Err(error) = prefs::save_to(&settings_path, saved) {
                     eprintln!("pilcrow: could not save settings: {error:#}");
+                } else {
+                    PREFERENCES_DIRTY.store(false, Ordering::Relaxed);
                 }
             })
             .detach();
@@ -260,6 +277,8 @@ pub struct NoteWindow {
     handle: Option<AnyWindowHandle>,
     /// Kept alive so the OS appearance callback stays registered.
     appearance_observer: Option<Subscription>,
+    /// Kept alive so activating this window updates the View menu checkmarks.
+    activation_observer: Option<Subscription>,
     autosave_task: Option<Task<()>>,
     autosave_revision: Option<u64>,
     /// The revision an autosave already failed on. A new edit retries; an
@@ -274,6 +293,10 @@ pub struct NoteWindow {
     offer_discard: bool,
     /// Two-step confirmation before permanently deleting an unsaved draft.
     confirm_discard: bool,
+    typing_chrome_hidden: bool,
+    pointer_awake: bool,
+    palette: Option<overlays::CommandPaletteState>,
+    versions_modal: Option<overlays::VersionsModalState>,
 }
 
 impl std::ops::Deref for NoteWindow {
@@ -315,30 +338,27 @@ impl NoteWindow {
         // changes the window chrome renders from (text, selection stats,
         // word count) re-render the window. Scroll, spell results, and
         // find-bar state repaint inside the editor alone.
-        cx.subscribe(&editor, |note, editor, event, cx| {
+        cx.subscribe(&editor, |note, _editor, event, cx| {
             match event {
                 EditorEvent::Edited { .. } => {
                     note.offer_discard = false;
                     note.confirm_discard = false;
+                    note.typing_chrome_hidden = true;
+                    note.pointer_awake = false;
                     note.schedule_autosave(cx);
                     note.schedule_draft(cx);
                 }
                 EditorEvent::ModeChanged => {
-                    let view = editor.read(cx);
-                    let focus = view.focus_enabled().then(|| match view.focus_scope() {
-                        FocusScope::Paragraph => MenuFocus::Paragraph,
-                        FocusScope::Sentence => MenuFocus::Sentence,
-                    });
-                    let typewriter = view.typewriter_enabled();
-                    let reading = view.view_state().3;
-                    cx.set_global(ActiveEditorModes {
-                        focus,
-                        typewriter,
-                        reading,
-                    });
-                    install_menus(cx);
+                    note.sync_active_modes(cx);
                 }
-                EditorEvent::SelectionChanged | EditorEvent::StatsChanged => {}
+                EditorEvent::StatsChanged => {
+                    note.typing_chrome_hidden = false;
+                }
+                EditorEvent::SelectionChanged => {
+                    if note.editor.read(cx).selection().is_some() {
+                        note.typing_chrome_hidden = false;
+                    }
+                }
             }
             cx.notify();
         })
@@ -381,6 +401,7 @@ impl NoteWindow {
             close_revision: None,
             handle: None,
             appearance_observer: None,
+            activation_observer: None,
             autosave_task: None,
             autosave_revision: None,
             autosave_failed_revision: None,
@@ -390,6 +411,10 @@ impl NoteWindow {
             autosave_first_dirty: None,
             offer_discard: false,
             confirm_discard: false,
+            typing_chrome_hidden: false,
+            pointer_awake: false,
+            palette: None,
+            versions_modal: None,
         }
     }
 
@@ -456,13 +481,56 @@ impl NoteWindow {
         dirty
     }
 
-    /// The complete platform title, including the quiet edited marker.
+    /// Whether the visible `— Edited` chrome badge should appear. Normal
+    /// autosaved edits stay quiet on saved files while native `set_window_edited`
+    /// still tracks exact dirty state; untitled notes, conflicts, errors, and
+    /// recovered drafts surface `— Edited`.
+    pub fn shows_edited_badge(&self, cx: &App) -> bool {
+        self.is_dirty(cx)
+            && (self.path.is_none()
+                || self.recovered
+                || self.conflict
+                || self.error.is_some()
+                || self.autosave_failed_revision.is_some())
+    }
+
+    /// Whether the footer status bar should fade out to keep the writing
+    /// surface quiet while typing or in Focus Mode.
+    pub fn is_chrome_hidden(&self, cx: &App) -> bool {
+        if self.recovered
+            || self.offer_discard
+            || self.conflict
+            || self.error.is_some()
+            || self.editor.read(cx).selection().is_some()
+        {
+            return false;
+        }
+        self.typing_chrome_hidden || (self.editor.read(cx).focus_enabled() && !self.pointer_awake)
+    }
+
+    /// The complete platform title, including the edited marker when visible.
     pub fn window_title(&self, cx: &App) -> String {
         let mut title = self.title(cx);
-        if self.is_dirty(cx) {
+        if self.shows_edited_badge(cx) {
             title.push_str(" — Edited");
         }
         title
+    }
+
+    fn sync_active_modes(&self, cx: &mut App) {
+        let view = self.editor.read(cx);
+        let focus = view.focus_enabled().then(|| match view.focus_scope() {
+            FocusScope::Paragraph => MenuFocus::Paragraph,
+            FocusScope::Sentence => MenuFocus::Sentence,
+        });
+        let typewriter = view.typewriter_enabled();
+        let reading = view.view_state().3;
+        cx.set_global(ActiveEditorModes {
+            focus,
+            typewriter,
+            reading,
+        });
+        install_menus(cx);
     }
 
     fn focus_editor(&self, window: &mut Window, cx: &mut App) {
@@ -483,8 +551,13 @@ impl NoteWindow {
         });
     }
 
-    fn new_note(&mut self, _: &NewNote, _window: &mut Window, cx: &mut Context<Self>) {
-        open_note_window(cx, "", None, None, None, None, None, false, None);
+    fn new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
+        let cascade = saved_frame(window.window_bounds()).map(|(mut f, _)| {
+            f.x += 24.0;
+            f.y += 24.0;
+            (f, false)
+        });
+        open_note_window_framed(cx, "", None, None, None, None, None, false, None, cascade);
     }
 
     fn open(&mut self, _: &Open, _window: &mut Window, cx: &mut Context<Self>) {
@@ -669,18 +742,20 @@ impl NoteWindow {
         };
 
         let adopting = identity.is_some();
+        let was_closing = self.close_after_save;
         let mut adopted = false;
         match result {
             Ok((disk, canonical)) => {
                 adopted = adopting;
                 let root = app_data_root(cx);
                 let backup_path = path.clone();
-                let previous = self.saved_text.to_string();
+                let previous = (!adopting).then(|| Arc::clone(&self.saved_text));
                 let backup_text = snapshot.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        if !previous.is_empty()
-                            && previous.as_str() != &*backup_text
+                        if let Some(previous) = previous
+                            && !previous.is_empty()
+                            && previous != backup_text
                             && let Err(error) =
                                 backups::snapshot(&root, &backup_path, previous.as_bytes())
                         {
@@ -738,8 +813,14 @@ impl NoteWindow {
                     self.conflict = false;
                     self.conflict_disk = None;
                     self.conflict_revision = None;
+                    self.offer_discard = false;
+                    self.confirm_discard = false;
                     self.autosave_failed_revision = None;
                     self.autosave_first_dirty = None;
+                }
+                if adopted {
+                    remember_recent(cx, &path);
+                    cx.defer(persist_session_on_close);
                 }
             }
             Err(SaveFailure::Conflict(observed)) if !adopting => {
@@ -748,6 +829,10 @@ impl NoteWindow {
                 self.conflict_revision = Some(self.editor.read(cx).revision());
                 self.close_after_save = false;
                 self.close_revision = None;
+                if was_closing {
+                    self.offer_discard = true;
+                    self.confirm_discard = false;
+                }
                 self.error = Some(format!(
                     "{} changed on disk since it was opened. Save again to overwrite it.",
                     path.display()
@@ -770,6 +855,10 @@ impl NoteWindow {
                 }
                 self.close_after_save = false;
                 self.close_revision = None;
+                if was_closing {
+                    self.offer_discard = true;
+                    self.confirm_discard = false;
+                }
                 self.error = Some(format!(
                     "{} changed while saving. Nothing was written.",
                     path.display()
@@ -785,6 +874,10 @@ impl NoteWindow {
                 self.error = Some(format!("Could not save {}: {error:#}", path.display()));
                 self.close_after_save = false;
                 self.close_revision = None;
+                if was_closing {
+                    self.offer_discard = true;
+                    self.confirm_discard = false;
+                }
             }
         }
 
@@ -1082,9 +1175,21 @@ impl NoteWindow {
         if let Some(draft_id) = self.draft_id.take() {
             drafts::remove_from(&app_data_root(cx), &draft_id);
         }
+        if let Some(path) = self.path.clone()
+            && self.is_dirty(cx)
+        {
+            let _ = backups::snapshot(
+                &app_data_root(cx),
+                &path,
+                self.editor.read(cx).text().as_bytes(),
+            );
+        }
         let current: Arc<str> = Arc::from(self.editor.read(cx).text());
         self.set_saved(current);
         self.dirty_cache.set(None);
+        self.conflict = false;
+        self.conflict_disk = None;
+        self.conflict_revision = None;
         self.close_after_save = false;
         self.offer_discard = false;
         self.confirm_discard = false;
@@ -1106,23 +1211,36 @@ impl NoteWindow {
         self.focus_editor(window, cx);
     }
 
-    fn reload_conflict(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn reload_conflict(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_ime(window, cx);
         let Some(path) = self.path.clone() else {
             return;
         };
+        let dirty_backup = self.is_dirty(cx).then(|| self.editor.read(cx).save_text());
+        let root = app_data_root(cx);
         let read_path = path.clone();
-        cx.spawn(async move |this, cx| {
+        let backup_path = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { file::read(&read_path) })
+                .spawn(async move {
+                    if let Some(bytes) = dirty_backup {
+                        let _ = backups::snapshot(&root, &backup_path, bytes.as_bytes());
+                    }
+                    file::read(&read_path)
+                })
                 .await;
-            this.update(cx, |note, cx| {
+            this.update_in(cx, |note, window, cx| {
+                if note.path.as_deref() != Some(path.as_path()) {
+                    return;
+                }
                 match result {
                     Ok((text, disk)) => {
                         note.editor
                             .update(cx, |editor, cx| editor.replace_document(&text, cx));
                         note.set_saved(Arc::from(text));
                         note.dirty_cache.set(None);
+                        note.title_cache.set(None);
                         note.disk = Some(disk);
                         note.conflict = false;
                         note.conflict_disk = None;
@@ -1130,6 +1248,12 @@ impl NoteWindow {
                         note.error = None;
                         note.close_after_save = false;
                         note.close_revision = None;
+                        note.autosave_revision = None;
+                        note.autosave_failed_revision = None;
+                        note.autosave_first_dirty = None;
+                        note.offer_discard = false;
+                        note.confirm_discard = false;
+                        note.focus_editor(window, cx);
                     }
                     Err(error) => {
                         note.error = Some(format!("Could not reload {}: {error}", path.display()));
@@ -1285,13 +1409,15 @@ impl NoteWindow {
         cycle_note(cx, false);
     }
 
-    fn copy_html(&mut self, _: &CopyHtml, _window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_html(&mut self, _: &CopyHtml, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_ime(window, cx);
         let title = self.title(cx);
         let html = export::document(self.editor.read(cx).text(), &title);
         cx.write_to_clipboard(ClipboardItem::new_string(html));
     }
 
     fn export_html(&mut self, _: &ExportHtml, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_ime(window, cx);
         let title = self.title(cx);
         let directory = default_save_directory(self.path.as_deref());
         let suggested = format!("{}.html", safe_file_stem(&title));
@@ -1546,7 +1672,8 @@ impl Render for NoteWindow {
         }
         let title = self.title(cx);
         let dirty = self.is_dirty(cx);
-        let desired = if dirty {
+        let show_edited = self.shows_edited_badge(cx);
+        let desired = if show_edited {
             format!("{title} — Edited")
         } else {
             title.clone()
@@ -1572,34 +1699,49 @@ impl Render for NoteWindow {
             self.last_document_path = Some(self.path.clone());
         }
 
-        let mut left = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .min_w(px(0.0))
-            .child(div().text_color(self.tokens.mid).child(title));
-        if dirty {
+        let mut left = div().flex().items_center().gap_2().min_w(px(0.0)).child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(self.tokens.mid)
+                .child(title),
+        );
+        if show_edited {
             left = left.child(
                 div()
+                    .flex_shrink_0()
                     .debug_selector(|| "note-status-dirty".into())
                     .text_color(self.tokens.dim)
-                    .child(" — Edited"),
+                    .child("— Edited"),
             );
         }
         if self.recovered {
             left = left.child(
                 div()
+                    .flex_shrink_0()
                     .debug_selector(|| "note-status-recovered".into())
                     .text_color(self.tokens.accent)
                     .child("Recovered draft"),
             );
         }
-        if self.recovered || (self.offer_discard && self.path.is_none() && dirty) {
+        if self.recovered || self.offer_discard {
+            let confirm_label = if self.path.is_some() {
+                "Confirm close"
+            } else {
+                "Confirm discard"
+            };
+            let action_label = if self.path.is_some() {
+                "Close without saving"
+            } else {
+                "Discard"
+            };
             if self.confirm_discard {
                 left = left
                     .child(
                         div()
                             .id("keep-draft")
+                            .role(Role::Button)
+                            .flex_shrink_0()
                             .cursor_pointer()
                             .text_color(self.tokens.dim)
                             .child("Keep")
@@ -1608,18 +1750,22 @@ impl Render for NoteWindow {
                     .child(
                         div()
                             .id("discard-draft")
+                            .role(Role::Button)
+                            .flex_shrink_0()
                             .cursor_pointer()
                             .text_color(self.tokens.spell)
-                            .child("Confirm discard")
+                            .child(confirm_label)
                             .on_click(cx.listener(Self::discard_recovered)),
                     );
             } else {
                 left = left.child(
                     div()
                         .id("discard-draft")
+                        .role(Role::Button)
+                        .flex_shrink_0()
                         .cursor_pointer()
                         .text_color(self.tokens.dim)
-                        .child("Discard")
+                        .child(action_label)
                         .on_click(cx.listener(Self::discard_recovered)),
                 );
             }
@@ -1650,6 +1796,7 @@ impl Render for NoteWindow {
             .child(stats);
         let appearance = div()
             .id("appearance-toggle")
+            .role(Role::Button)
             .debug_selector(|| "appearance-toggle".into())
             .cursor_pointer()
             .text_color(self.tokens.dim)
@@ -1658,13 +1805,16 @@ impl Render for NoteWindow {
 
         let right = div()
             .flex()
+            .flex_shrink_0()
             .items_center()
             .gap_3()
             .child(stats)
             .child(appearance);
+        let chrome_hidden = self.is_chrome_hidden(cx);
         let status = div()
             .id("note-status")
             .debug_selector(|| "note-status".into())
+            .font_family("IBM Plex Mono")
             .flex()
             .items_center()
             .justify_between()
@@ -1672,13 +1822,16 @@ impl Render for NoteWindow {
             .h(px(24.0))
             .px(px(20.0))
             .text_size(px(11.0))
+            .opacity(if chrome_hidden { 0.0 } else { 1.0 })
             .child(left)
             .child(right);
 
         let banner = self.error.clone().map(|error| {
             let mut row = div()
                 .id("note-banner")
+                .role(Role::Alert)
                 .debug_selector(|| "note-banner".into())
+                .font_family("IBM Plex Mono")
                 .flex()
                 .items_center()
                 .gap_3()
@@ -1693,6 +1846,7 @@ impl Render for NoteWindow {
                     .child(
                         div()
                             .id("conflict-reload")
+                            .role(Role::Button)
                             .cursor_pointer()
                             .text_color(self.tokens.accent)
                             .child("Reload")
@@ -1701,6 +1855,7 @@ impl Render for NoteWindow {
                     .child(
                         div()
                             .id("conflict-save-as")
+                            .role(Role::Button)
                             .cursor_pointer()
                             .text_color(self.tokens.accent)
                             .child("Save As")
@@ -1709,6 +1864,7 @@ impl Render for NoteWindow {
                     .child(
                         div()
                             .id("conflict-overwrite")
+                            .role(Role::Button)
                             .cursor_pointer()
                             .text_color(self.tokens.spell)
                             .child("Overwrite")
@@ -1718,8 +1874,9 @@ impl Render for NoteWindow {
                 row = row.child(
                     div()
                         .id("banner-dismiss")
+                        .role(Role::Button)
                         .cursor_pointer()
-                        .text_color(self.tokens.dim)
+                        .text_color(self.tokens.ink)
                         .child("Dismiss")
                         .on_click(cx.listener(Self::dismiss_error)),
                 );
@@ -1730,10 +1887,18 @@ impl Render for NoteWindow {
         div()
             .id("note-window")
             .key_context("NoteWindow")
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(self.tokens.paper)
+            .on_mouse_move(cx.listener(|note, _: &MouseMoveEvent, _window, cx| {
+                if note.typing_chrome_hidden || !note.pointer_awake {
+                    note.typing_chrome_hidden = false;
+                    note.pointer_awake = true;
+                    cx.notify();
+                }
+            }))
             .on_drop::<ExternalPaths>(|paths, _window, cx| {
                 for path in paths.paths() {
                     open_note_path(cx, path.clone());
@@ -1762,6 +1927,8 @@ impl Render for NoteWindow {
             .on_action(cx.listener(Self::measure_narrow))
             .on_action(cx.listener(Self::measure_standard))
             .on_action(cx.listener(Self::measure_wide))
+            .on_action(cx.listener(Self::toggle_command_palette))
+            .on_action(cx.listener(Self::browse_versions))
             .when_some(banner, |root, banner| root.child(banner))
             .child(
                 div()
@@ -1772,6 +1939,12 @@ impl Render for NoteWindow {
                     .child(self.editor.clone()),
             )
             .child(status)
+            .when_some(self.render_palette_overlay(cx), |root, overlay| {
+                root.child(overlay)
+            })
+            .when_some(self.render_versions_overlay(cx), |root, overlay| {
+                root.child(overlay)
+            })
     }
 }
 
@@ -1987,7 +2160,7 @@ fn write_recovery(
     let name = recovery_name(title);
     let mut candidates = Vec::new();
     candidates.push(data_root.join("recovery"));
-    candidates.push(std::env::temp_dir().join("pilcrow-next-recovery"));
+    candidates.push(std::env::temp_dir().join("pilcrow-recovery"));
     if let Some(parent) = note_path.and_then(Path::parent) {
         candidates.push(parent.to_path_buf());
     }
@@ -2003,14 +2176,13 @@ fn write_recovery(
             );
             continue;
         }
-        let path =
-            if directory.ends_with("recovery") || directory.ends_with("pilcrow-next-recovery") {
-                directory.join(&name)
-            } else {
-                // A sidecar next to the note is the fallback when the app data
-                // directory is not writable.
-                directory.join(format!(".{name}.recovery"))
-            };
+        let path = if directory.ends_with("recovery") || directory.ends_with("pilcrow-recovery") {
+            directory.join(&name)
+        } else {
+            // A sidecar next to the note is the fallback when the app data
+            // directory is not writable.
+            directory.join(format!(".{name}.recovery"))
+        };
         if let Err(error) = file::write_atomic(&path, text.as_bytes()) {
             eprintln!(
                 "pilcrow: could not write recovery copy {}: {error:#}",
@@ -2068,6 +2240,7 @@ fn cycle_note(cx: &mut App, forward: bool) {
         note.update(cx, |note, window, cx| {
             window.activate_window();
             note.focus_editor(window, cx);
+            note.sync_active_modes(cx);
         })
         .ok();
     }
@@ -2081,6 +2254,7 @@ fn focus_note(cx: &mut App, handle: AnyWindowHandle) -> bool {
         .update(cx, |note, window, cx| {
             window.activate_window();
             note.focus_editor(window, cx);
+            note.sync_active_modes(cx);
         })
         .is_ok()
 }
@@ -2121,24 +2295,24 @@ fn window_options_for(
     let bounds = restored.unwrap_or_else(|| {
         WindowBounds::Windowed(Bounds::centered(None, size(px(1000.0), px(720.0)), cx))
     });
+    #[cfg(target_os = "macos")]
+    let titlebar = TitlebarOptions {
+        title: Some(title.to_owned().into()),
+        appears_transparent: true,
+        traffic_light_position: Some(point(px(14.0), px(14.0))),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let titlebar = TitlebarOptions {
+        title: Some(title.to_owned().into()),
+        ..Default::default()
+    };
     WindowOptions {
         window_bounds: Some(bounds),
-        titlebar: Some(TitlebarOptions {
-            title: Some(title.to_owned().into()),
-            ..Default::default()
-        }),
+        titlebar: Some(titlebar),
         app_id: Some("dev.pilcrow.Pilcrow".to_owned()),
-        // The measured column plus the left margin needs roughly 800pt at the
-        // default size/measure. Keep the window from clipping a larger
-        // reader-selected setting; the exact face-driven minimum comes with
-        // packaging.
-        window_min_size: Some(size(
-            px(
-                820.0 * current_prefs(cx).text_scale * current_prefs(cx).measure.chars() as f32
-                    / 66.0,
-            ),
-            px(480.0 * current_prefs(cx).text_scale),
-        )),
+        // Allow laptop split-screen and tiling widths; `responsive_page_for`
+        // adapts margins and column width down cleanly to the floor.
+        window_min_size: Some(size(px(460.0), px(340.0))),
         ..Default::default()
     }
 }
@@ -2263,15 +2437,22 @@ fn capture_session(cx: &mut App) -> (PathBuf, session::Session) {
             continue;
         };
         let Ok(captured) = handle.update(cx, |note, window, cx| {
+            let editor = note.editor.read(cx);
             (
                 note.path.clone(),
-                note.editor.read(cx).view_state(),
+                editor.view_state(),
+                editor.focus_scope() == FocusScope::Sentence,
                 saved_frame(window.window_bounds()),
             )
         }) else {
             continue;
         };
-        let (Some(path), (caret, anchor, scroll, reading, focus, typewriter), frame) = captured
+        let (
+            Some(path),
+            (caret, anchor, scroll, reading, focus, typewriter),
+            focus_sentence,
+            frame,
+        ) = captured
         else {
             continue;
         };
@@ -2286,6 +2467,7 @@ fn capture_session(cx: &mut App) -> (PathBuf, session::Session) {
             scroll,
             reading,
             focus,
+            focus_sentence,
             typewriter,
             frame,
             maximized,
@@ -2299,6 +2481,7 @@ fn capture_session(cx: &mut App) -> (PathBuf, session::Session) {
 /// Save the paths and view positions of every open, titled note. No text is
 /// written here: the file is still the only document.
 fn persist_session(cx: &mut App) {
+    SESSION_GENERATION.fetch_add(1, Ordering::SeqCst);
     let (root, saved) = capture_session(cx);
     if let Err(error) = session::save(&root, &saved) {
         eprintln!("pilcrow: could not save the session: {error:#}");
@@ -2312,9 +2495,13 @@ fn persist_session_on_close(cx: &mut App) {
     }
     #[cfg(not(test))]
     {
+        let generation = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let (root, saved) = capture_session(cx);
         cx.background_executor()
             .spawn(async move {
+                if SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
                 if let Err(error) = session::save(&root, &saved) {
                     eprintln!("pilcrow: could not save the session: {error:#}");
                 }
@@ -2366,13 +2553,23 @@ fn restore_session(cx: &mut App) -> usize {
         let scroll = saved.scroll;
         let reading = saved.reading;
         let focus = saved.focus;
+        let focus_sentence = saved.focus_sentence;
         let typewriter = saved.typewriter;
         handle
             .update(cx, |note, _, cx| {
                 note.editor.update(cx, |editor, cx| {
                     editor
                         .restore_view_state(caret, anchor, scroll, reading, focus, typewriter, cx);
+                    editor.restore_focus_scope(
+                        if focus_sentence {
+                            FocusScope::Sentence
+                        } else {
+                            FocusScope::Paragraph
+                        },
+                        cx,
+                    );
                 });
+                note.sync_active_modes(cx);
             })
             .ok();
         opened += 1;
@@ -2390,10 +2587,18 @@ fn open_note_path(cx: &mut App, path: PathBuf) {
     }
     cx.spawn(async move |cx| {
         let read_path = path.clone();
-        let identity = file::identity(&read_path).ok();
-        let read = cx
+        let (identity, existed, read) = cx
             .background_executor()
-            .spawn(async move { file::read(&read_path) })
+            .spawn(async move {
+                let identity = file::identity(&read_path).ok();
+                let existed = match fs::metadata(&read_path) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                };
+                let read = file::read(&read_path);
+                (identity, existed, read)
+            })
             .await;
         cx.update(move |cx| {
             if let Some(identity) = identity.as_ref()
@@ -2423,7 +2628,7 @@ fn open_note_path(cx: &mut App, path: PathBuf) {
                         None,
                         None,
                         None,
-                        Some(path.clone()),
+                        existed.then_some(path.clone()),
                         None,
                         false,
                         Some(format!("Could not open {}: {error}", path.display())),
@@ -2438,30 +2643,31 @@ fn open_note_path(cx: &mut App, path: PathBuf) {
 /// Decode a platform open URL into a note path. Only local file URLs and plain
 /// paths are accepted; network schemes are ignored.
 fn open_url_path(value: &str) -> Option<PathBuf> {
-    let rest = if let Some(rest) = value.strip_prefix("file://") {
-        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if !host.is_empty() && host != "localhost" {
-            return None;
-        }
-        format!("/{path}")
-    } else {
+    let Some(rest) = value.strip_prefix("file://") else {
         if value.contains("://") {
             return None;
         }
-        value.to_owned()
+        return (!value.is_empty()).then(|| PathBuf::from(value));
     };
-    let rest = rest.as_str();
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !host.is_empty() && host != "localhost" {
+        return None;
+    }
+    let rest = format!("/{path}");
     let mut bytes_out = Vec::with_capacity(rest.len());
     let bytes = rest.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                bytes_out.push(byte);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+            && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            bytes_out.push(byte);
+            index += 3;
+            continue;
         }
         bytes_out.push(bytes[index]);
         index += 1;
@@ -2573,6 +2779,20 @@ fn open_note_window(
     recovered: bool,
     error: Option<String>,
 ) -> WindowHandle<NoteWindow> {
+    let cascade = cx
+        .active_window()
+        .or_else(|| cx.windows().last().copied())
+        .and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| saved_frame(window.window_bounds()))
+                .ok()
+        })
+        .flatten()
+        .map(|(mut f, _)| {
+            f.x += 24.0;
+            f.y += 24.0;
+            (f, false)
+        });
     open_note_window_framed(
         cx,
         text,
@@ -2583,7 +2803,7 @@ fn open_note_window(
         draft_id,
         recovered,
         error,
-        None,
+        cascade,
     )
 }
 
@@ -2658,9 +2878,16 @@ fn open_note_window_framed(
                     .ok();
                 cx.refresh_windows();
             });
-            note.update(cx, |note, _| {
+            note.update(cx, |note, cx| {
                 note.handle = Some(handle);
                 note.appearance_observer = Some(appearance_observer);
+                note.activation_observer =
+                    Some(cx.observe_window_activation(window, |note, window, cx| {
+                        if window.is_window_active() {
+                            note.sync_active_modes(cx);
+                        }
+                    }));
+                note.sync_active_modes(cx);
             });
             #[cfg(feature = "test-driver")]
             {
@@ -2747,12 +2974,17 @@ fn open_note_dialog(cx: &mut App) {
         };
 
         let read_path = path.clone();
-        let (identity, read_result) = cx
+        let (identity, existed, read_result) = cx
             .background_executor()
             .spawn(async move {
                 let identity = file::identity(&read_path).ok();
+                let existed = match fs::metadata(&read_path) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                };
                 let read = file::read(&read_path);
-                (identity, read)
+                (identity, existed, read)
             })
             .await;
 
@@ -2786,7 +3018,7 @@ fn open_note_dialog(cx: &mut App) {
                         None,
                         None,
                         None,
-                        Some(path_for_ui.clone()),
+                        existed.then_some(path_for_ui.clone()),
                         None,
                         false,
                         Some(format!("Could not open {}: {error}", path_for_ui.display())),
@@ -2801,8 +3033,9 @@ fn open_note_dialog(cx: &mut App) {
 /// Open every draft left by a crash or an earlier untitled session. They stay
 /// dirty and keep their draft ids, so closing them asks for a path unless the
 /// person explicitly discards the recovery.
-fn recover_drafts(cx: &mut App) {
+fn recover_drafts(cx: &mut App) -> usize {
     let root = app_data_root(cx);
+    let mut recovered = 0;
     for draft in drafts::list_from(&root) {
         open_note_window(
             cx,
@@ -2815,11 +3048,12 @@ fn recover_drafts(cx: &mut App) {
             true,
             None,
         );
+        recovered += 1;
     }
+    recovered
 }
 
-/// Install the native menu bar from the shared command model.
-fn install_menus(cx: &mut App) {
+pub(crate) fn menu_options_for(cx: &App) -> MenuOptions {
     let appearance = match current_prefs(cx).appearance {
         prefs::Appearance::Auto => MenuAppearance::Auto,
         prefs::Appearance::Light => MenuAppearance::Light,
@@ -2834,14 +3068,19 @@ fn install_menus(cx: &mut App) {
         .try_global::<ActiveEditorModes>()
         .copied()
         .unwrap_or_default();
-    let options = MenuOptions::default()
+    MenuOptions::default()
         .with_appearance(appearance)
         .with_measure(measure)
         .with_high_contrast(current_prefs(cx).contrast == prefs::Contrast::High)
         .with_focus(modes.focus)
         .with_typewriter(modes.typewriter)
         .with_reading(modes.reading)
-        .with_recent(recent_menu_labels(cx));
+        .with_recent(recent_menu_labels(cx))
+}
+
+/// Install the native menu bar from the shared command model.
+fn install_menus(cx: &mut App) {
+    let options = menu_options_for(cx);
     cx.set_menus(menus::menus(&options));
     app_identity::set_app_menu_title("Pilcrow");
 }
@@ -2884,7 +3123,7 @@ pub fn install(cx: &mut App) {
     file::cleanup_stale_temps(&root.join(drafts::RECOVERY_DIR));
     cx.set_global(AppDataRoot(root.clone()));
     #[cfg(not(test))]
-    let loaded = prefs::Prefs::with_env_override(prefs::load());
+    let loaded = prefs::Prefs::with_env_override(prefs::load_from(&root.join("settings.json")));
     #[cfg(test)]
     let loaded = prefs::Prefs::with_env_override(prefs::Prefs::default());
     cx.set_global(Preferences {
@@ -2893,6 +3132,7 @@ pub fn install(cx: &mut App) {
         measure: loaded.measure,
         contrast: loaded.contrast,
     });
+    sync_platform_appearance(cx, loaded.appearance);
     cx.set_global(RecentFiles(session::load(&root).recent));
     install_keybindings(cx);
     install_menus(cx);
@@ -2907,6 +3147,19 @@ pub fn install(cx: &mut App) {
     // a dedicated thread. A write that misses the shutdown window leaves its
     // recovery copy behind rather than blocking the foreground.
     cx.on_app_quit(|cx| {
+        #[cfg(not(test))]
+        if PREFERENCES_DIRTY.swap(false, Ordering::Relaxed) {
+            let prefs = current_prefs(cx);
+            let saved = prefs::Prefs {
+                appearance: prefs.appearance,
+                text_scale: prefs.text_scale,
+                measure: prefs.measure,
+                contrast: prefs.contrast,
+            };
+            if let Err(error) = prefs::save_to(&app_data_root(cx).join("settings.json"), saved) {
+                eprintln!("pilcrow: could not save settings: {error:#}");
+            }
+        }
         persist_session(cx);
         let (work, clipboard) = prepare_quit(cx);
         write_clipboard_fallback(cx, clipboard);
@@ -2971,12 +3224,22 @@ fn close_startup_untitled_if_pristine(
     }
 }
 
+fn has_launch_note(has_env_open: bool, note: &InitialNote) -> bool {
+    has_env_open || note.path.is_some() || note.error.is_some()
+}
+
 /// Launch the application.
 pub fn run() {
     let has_open = std::env::var_os("PILCROW_OPEN").is_some_and(|path| !path.is_empty());
     let note = initial_note();
+    let has_launch = has_launch_note(has_open, &note);
     let (url_sender, url_receiver) = async_channel::unbounded();
-    let application = gpui_platform::application().with_quit_mode(QuitMode::LastWindowClosed);
+    let application = gpui_platform::application().with_quit_mode(QuitMode::Default);
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_note_window(cx, "", None, None, None, None, None, false, None);
+        }
+    });
     application.on_open_urls(move |urls| {
         let _ = url_sender.try_send(urls);
     });
@@ -2992,9 +3255,9 @@ pub fn run() {
                 }
             }
         }
-        let mut startup_blank = if has_open || (!opened_from_url && restore_session(cx) == 0) {
+        let mut startup_blank = if has_launch || (!opened_from_url && restore_session(cx) == 0) {
             let is_blank_fallback =
-                !has_open && note.path.is_none() && note.text.is_empty() && note.error.is_none();
+                !has_launch && note.path.is_none() && note.text.is_empty() && note.error.is_none();
             let handle = open_note_window(
                 cx,
                 &note.text,
@@ -3027,21 +3290,48 @@ pub fn run() {
             }
         })
         .detach();
-        recover_drafts(cx);
+        if recover_drafts(cx) > 0 {
+            close_startup_untitled_if_pristine(cx, &mut startup_blank);
+        }
         cx.activate(true);
     });
 }
 
-/// Items for File → Open Recent. An empty list is one disabled placeholder so
-/// the submenu never appears broken.
+/// Items for File → Open Recent. Duplicate basenames include their parent
+/// directory so distinct files with matching names remain identifiable.
 fn recent_menu_labels(cx: &App) -> Vec<(String, PathBuf)> {
-    current_recent(cx)
-        .into_iter()
+    let recent = current_recent(cx);
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let names: Vec<String> = recent
+        .iter()
         .map(|path| {
-            let label = path.file_name().map_or_else(
+            let name = path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
             );
+            *counts.entry(name.clone()).or_insert(0) += 1;
+            name
+        })
+        .collect();
+    recent
+        .into_iter()
+        .zip(names)
+        .map(|(path, name)| {
+            let label = if counts.get(&name).copied().unwrap_or(0) > 1
+                && let Some(parent) = path.parent()
+            {
+                let parent_label = parent
+                    .file_name()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| parent.display().to_string());
+                if parent_label.is_empty() {
+                    name
+                } else {
+                    format!("{name} — {parent_label}")
+                }
+            } else {
+                name
+            };
             (label, path)
         })
         .collect()

@@ -51,6 +51,23 @@ pub fn fits(window_width: f32, page: Page) -> bool {
     right_for(window_width, page) >= 24.0
 }
 
+/// Place a column responsively inside `window_width`: preserves [`page_for`]
+/// whenever it fits comfortably, and narrows margins + column together on
+/// laptop split-screen widths so prose never clips past the right edge.
+pub fn responsive_page_for(window_width: f32, desired_column: f32) -> Page {
+    let default_page = page_for(window_width, desired_column);
+    if fits(window_width, default_page) {
+        return default_page;
+    }
+    let margin = (window_width * 0.08).clamp(24.0, 72.0);
+    let column = (window_width - margin * 2.0).max(120.0).min(desired_column);
+    Page {
+        head: HEAD,
+        margin,
+        column,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +128,24 @@ mod tests {
         let wide = page_for(1600.0, COLUMN);
         assert_eq!(narrow.column, wide.column);
         assert!(right_for(1600.0, wide) > right_for(1000.0, narrow));
+    }
+
+    #[test]
+    fn responsive_page_clamps_narrow_split_windows_without_changing_wide_ones() {
+        assert_eq!(responsive_page_for(900.0, COLUMN), page_for(900.0, COLUMN));
+        assert_eq!(
+            responsive_page_for(1600.0, COLUMN),
+            page_for(1600.0, COLUMN)
+        );
+
+        for width in [460.0, 600.0, 720.0] {
+            let page = responsive_page_for(width, COLUMN);
+            assert!(page.column <= COLUMN);
+            assert!(
+                page.margin + page.column < width,
+                "column overflowed narrow width {width}: {page:?}"
+            );
+            assert!(right_for(width, page) >= 24.0);
+        }
     }
 }

@@ -94,9 +94,19 @@ impl EntityInputHandler for EditorView {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         if let Some(find) = self.find.as_ref().filter(|find| find.editing) {
-            return Some(find.value().encode_utf16().count());
+            let value = find.value();
+            return Some(if value.is_ascii() {
+                value.len()
+            } else {
+                value.encode_utf16().count()
+            });
         }
-        Some(self.buffer.text().encode_utf16().count())
+        let text = self.buffer.text();
+        Some(if text.is_ascii() {
+            text.len()
+        } else {
+            text.encode_utf16().count()
+        })
     }
 
     fn marked_text_range(
@@ -205,7 +215,7 @@ impl EntityInputHandler for EditorView {
                         composition.current_len = composition.current_len.saturating_sub(removed);
                         composition.committed = false;
                     }
-                    self.invalidate_after_edit(old_revision, start, start, cx);
+                    self.invalidate_after_edit(old_revision, start, end, start, cx);
                     self.anchor = None;
                     self.marked = None;
                     self.desired_x = None;
@@ -254,7 +264,7 @@ impl EntityInputHandler for EditorView {
                     .saturating_sub(end - start);
                 composition.committed = true;
             }
-            self.invalidate_after_edit(old_revision, start, start + text.len(), cx);
+            self.invalidate_after_edit(old_revision, start, end, start + text.len(), cx);
             self.anchor = None;
             self.marked = None;
             self.desired_x = None;
@@ -270,6 +280,29 @@ impl EntityInputHandler for EditorView {
                 let range = self.byte_range_from_utf16(range);
                 self.replace_range(range, "", EditGroup::Delete, window, cx);
             }
+            return;
+        }
+        let sel_start = self.selection_start();
+        let sel_end = self.selection_end();
+        if sel_start < sel_end
+            && matches!(text.as_str(), "*" | "_" | "`" | "~" | "\"")
+            && range_utf16
+                .as_ref()
+                .is_none_or(|r| self.byte_range_from_utf16(r.clone()) == (sel_start..sel_end))
+        {
+            let selected = self.buffer.text()[sel_start..sel_end].to_owned();
+            let dlen = text.len();
+            let wrapped = format!("{text}{selected}{text}");
+            self.replace_range(sel_start..sel_end, &wrapped, EditGroup::Other, window, cx);
+            let inner_start = sel_start + dlen;
+            let inner_end = inner_start + selected.len();
+            self.anchor = Some(inner_start);
+            self.caret = inner_end;
+            self.history
+                .set_last_selection_after(Some((inner_start, inner_end)));
+            self.reveal_caret();
+            window.notify_text_selection_changed(&self.focus_handle);
+            cx.notify();
             return;
         }
         let range = range_utf16
@@ -358,7 +391,7 @@ impl EntityInputHandler for EditorView {
                 .saturating_sub(end - start);
             composition.committed = false;
         }
-        self.invalidate_after_edit(old_revision, start, start + new_text.len(), cx);
+        self.invalidate_after_edit(old_revision, start, end, start + new_text.len(), cx);
         self.anchor = None;
         self.marked = Some(start..start + new_text.len());
         if let Some(selected) = new_selected_range {

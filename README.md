@@ -33,26 +33,38 @@ prompts for a keychain password. See `docs/RELEASE.md`.
 ## What it does
 
 - **The page is the product.** A measured writing column set in bundled IBM
-  Plex Mono, hanging Markdown markers, a size ladder for headings, tinted code,
-  and quiet rules. Light, dark, system, and a true black/white high-contrast
-  appearance are all solved for contrast.
+  Plex Mono (responsively clamped on narrow split-screen windows), hanging
+  Markdown markers and wrapped quote/list continuations, a size ladder for
+  headings, tinted inline code pills and padded fenced code blocks, single
+  `Enter` visual breaks while typing, and quiet rules. Light, dark, system,
+  and a true black/white high-contrast appearance are all solved for contrast.
 - **Markdown is the file.** The buffer is the bytes on disk; blocks, inline
   styles, and visual lines are derived. There is no rich-text tree or hidden
   second document.
 - **Typing stays immediate.** Layout is incremental and stays on the thread
   that paints the caret. A long paragraph rewraps from the edited visual line,
   block scans start at the changed neighborhood, stats compute off the UI
-  thread after a pause, and spellcheck waits for idle.
-- **Task lists are text.** `[ ]` and `[x]` remain visible, selectable source
-  text; clicking the marker toggles the `X`, and completed body text is struck
-  through.
+  thread after a pause, and spellcheck uses wavy underlines that preserve
+  unaffected ranges while typing.
+- **Task lists & editing ergonomics.** `[ ]` and `[x]` remain visible,
+  selectable source text; clicking the marker toggles the `X`, and completed
+  body text is struck through. Wrapping a selection with `*`, `_`, `` ` ``,
+  `~`, or `"`, `Tab`/`Shift+Tab` list indent/outdent, `⌘/Ctrl+Click` on
+  external links, and visual-line `Home`/`End` work out of the box.
 - **Find and replace.** `⌘F`/`Ctrl+F` opens the in-note bar with highlighted
   matches, next/previous wrapping, case sensitivity, replace, and replace-all
   as one undo step.
-- **Reading view.** `⌘R`/`Ctrl+R` shows a syntax-free display copy with page
-  navigation; it is read-only.
-- **Focus and typewriter modes.** Paragraph or sentence stays bright; the
-  caret can be held at a stable vertical position.
+- **Reading view.** `⌘R`/`Ctrl+R` shows a syntax-free display copy with rich
+  bold/italic/strike/inline-code spans, clickable external links, proportional
+  scroll sync, and keyboard paging; it is read-only.
+- **Command palette & local versions.** `⌘⇧P`/`Ctrl+Shift+P` opens a
+  searchable command palette built from the shared action/menu model for
+  keyboard-first access across macOS, Linux, and Windows. `⌘⌥V`/`Ctrl+Alt+V`
+  opens File → Browse Versions… to preview and undoably restore rolling local
+  snapshots.
+- **Focus and typewriter modes.** Paragraph or sentence stays bright; typewriter
+  mode holds the caret vertically centered with half-viewport bottom overscroll,
+  and the footer chrome fades quietly while typing or in Focus Mode.
 - **Text size, measure, and contrast.** Five persisted text sizes,
   Narrow/Standard/Wide measures, and a High Contrast appearance, available
   from View.
@@ -114,7 +126,7 @@ GitHub Actions:
 - `.github/workflows/release.yml` — tag/manual unsigned macOS `.app`,
   Linux `.tar.gz`, Windows `.zip`, checksums, and a GitHub Release.
 
-Current local baseline: **495 tests**, **87.0% line coverage**, clippy and fmt
+Current local baseline: **523 tests** (**525** with `test-driver`), **87.1% line coverage**, clippy and fmt
 clean. The testing contract is `docs/TESTING.md`.
 
 ## Documentation

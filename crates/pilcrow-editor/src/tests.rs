@@ -518,13 +518,22 @@ fn a_quote_is_indented_on_every_wrapped_line(cx: &mut TestAppContext) {
         marker: 0,
     })
     .indent;
-    for x in indent {
-        assert_eq!(x, expected, "quote line was not indented");
+    assert_eq!(
+        indent[0], expected,
+        "first quote line must use quote indent"
+    );
+    assert!(
+        indent[1] > expected,
+        "wrapped quote continuation should hang past '> ': {:?}",
+        indent
+    );
+    for x in &indent[1..] {
+        assert_eq!(*x, indent[1], "quote continuation lines must align");
     }
 }
 
 #[gpui::test]
-fn code_lines_have_abutting_backgrounds_and_do_not_wrap(cx: &mut TestAppContext) {
+fn code_lines_have_abutting_backgrounds_and_wrap_long_lines(cx: &mut TestAppContext) {
     let text = "```\nfn main() {}\nlet x = 1;\n```";
     let (cx, editor) = editor_window(cx, text);
     let (placed, boxes, column) = editor.read_with(&cx, |editor, _| {
@@ -550,7 +559,7 @@ fn code_lines_have_abutting_backgrounds_and_do_not_wrap(cx: &mut TestAppContext)
         );
     }
     for bounds in boxes {
-        assert!((bounds.size.width / px(1.0) - column).abs() < 0.01);
+        assert!((bounds.size.width / px(1.0) - (column + 24.0)).abs() < 0.01);
         assert!(bounds.size.height > px(0.0));
     }
 }
@@ -2886,4 +2895,376 @@ fn find_and_reading_modes_protect_document_selection_and_handle_reversed_ranges(
         editor.read_with(&cx, |editor, _| (editor.caret(), editor.selection())),
         before
     );
+}
+
+#[gpui::test]
+fn wheel_scroll_moves_downward_and_works_in_typewriter_mode(cx: &mut TestAppContext) {
+    let text = (0..300)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (mut cx, editor) = editor_window(cx, &text);
+    assert_eq!(editor.read_with(&cx, |editor, _| editor.scroll()), 0.0);
+
+    // Negative pixel delta represents scrolling down the page in GPUI.
+    cx.simulate_event(gpui::ScrollEvent {
+        position: point(px(200.0), px(200.0)),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let scrolled = editor.read_with(&cx, |editor, _| editor.scroll());
+    assert!(
+        scrolled > 0.0,
+        "downward scroll wheel did not scroll down: {scrolled}"
+    );
+
+    // In typewriter mode, wheel scrolling should remain free until the next edit or caret move.
+    cx.dispatch_action(ToggleTypewriter);
+    let centered = editor.read_with(&cx, |editor, _| editor.scroll());
+    cx.simulate_event(gpui::ScrollEvent {
+        position: point(px(200.0), px(200.0)),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-180.0))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let after_wheel = editor.read_with(&cx, |editor, _| editor.scroll());
+    assert!(
+        after_wheel > centered,
+        "typewriter mode locked out wheel scroll: centered={centered}, after_wheel={after_wheel}"
+    );
+}
+
+#[gpui::test]
+fn reading_view_ignores_format_and_clicks_while_supporting_keyboard_scroll(
+    cx: &mut TestAppContext,
+) {
+    let text = format!(
+        "- [ ] first task\n\n{}",
+        (0..120)
+            .map(|index| format!("paragraph {index}\n\n"))
+            .collect::<String>()
+    );
+    let (mut cx, editor) = editor_window(cx, &text);
+    cx.simulate_input("a");
+    cx.dispatch_action(ToggleReading);
+    redraw(&mut cx);
+    let before = editor.read_with(&cx, |editor, _| {
+        (
+            editor.text().to_owned(),
+            editor.caret(),
+            editor.selection(),
+            editor.history.undo_steps(),
+        )
+    });
+
+    cx.dispatch_action(FormatBold);
+    cx.simulate_click(point(px(200.0), px(100.0)), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let after = editor.read_with(&cx, |editor, _| {
+        (
+            editor.text().to_owned(),
+            editor.caret(),
+            editor.selection(),
+            editor.history.undo_steps(),
+            editor.mouse_selecting,
+        )
+    });
+    assert_eq!(
+        (after.0, after.1, after.2, after.3),
+        before,
+        "reading view mutated editor caret/selection/history"
+    );
+    assert!(!after.4, "reading view left mouse_selecting stuck");
+
+    cx.dispatch_action(Down);
+    redraw(&mut cx);
+    assert!(
+        editor.read_with(&cx, |editor, _| editor.reading_scroll.offset().y) < px(0.0),
+        "Down arrow did not scroll reading view"
+    );
+    cx.dispatch_action(End);
+    redraw(&mut cx);
+    let at_end = editor.read_with(&cx, |editor, _| editor.reading_scroll.offset().y);
+    assert!(
+        at_end < px(-100.0),
+        "End did not jump to bottom: {at_end:?}"
+    );
+    cx.dispatch_action(Home);
+    redraw(&mut cx);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.reading_scroll.offset().y),
+        px(0.0)
+    );
+}
+
+#[gpui::test]
+fn find_replace_bar_guards_undo_preserves_caret_on_replace_all_and_handles_keys(
+    cx: &mut TestAppContext,
+) {
+    let (mut cx, editor) = editor_window(cx, "cat one cat two");
+    cx.simulate_keystrokes("end");
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("home right right right right");
+    let caret_before_find = editor.read_with(&cx, |editor, _| editor.caret());
+    assert_eq!(caret_before_find, 4);
+
+    cx.dispatch_action(Find);
+    cx.simulate_input("cat");
+    // Cmd+Z while typing in Find must not undo the document's `!` or mutate the query.
+    cx.dispatch_action(Undo);
+    assert!(
+        editor.read_with(&cx, |editor, _| editor.text().ends_with('!')),
+        "Undo modified document while Find was active"
+    );
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.find_query().to_owned()),
+        "cat"
+    );
+
+    // Tab and Shift+Tab switch between Query and Replacement fields.
+    cx.simulate_keystrokes("tab");
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.find.as_ref().map(|f| f.field)),
+        Some(FindField::Replacement)
+    );
+    cx.simulate_input("dog");
+    cx.simulate_keystrokes("shift-tab");
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.find.as_ref().map(|f| f.field)),
+        Some(FindField::Query)
+    );
+
+    // Shift+Enter in Query steps backwards; Enter in Replacement replaces one match.
+    cx.simulate_keystrokes("shift-enter tab enter");
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "dog one cat two!"
+    );
+
+    // Replace All keeps caret near its pre-replace position (not teleported to EOF)
+    // and records EditGroup::ReplaceAll.
+    cx.dispatch_action(CloseFind);
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_selected_text_range(12..12, window, cx);
+        });
+    });
+    cx.dispatch_action(Find);
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            if let Some(find) = editor.find.as_mut() {
+                find.query = "a".to_owned();
+                find.query_cursor = 1;
+                find.replacement = "XX".to_owned();
+                find.replacement_cursor = 2;
+            }
+            editor.refresh_find(false, Some(window), cx);
+            editor.replace_current_match(true, window, cx);
+        });
+    });
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "dog one cXXt two!"
+    );
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.caret()),
+        12,
+        "Replace All teleported caret instead of mapping across replacements"
+    );
+}
+
+#[gpui::test]
+fn single_enter_breaks_visually_in_edit_view(cx: &mut TestAppContext) {
+    let (mut cx, editor) = editor_window(cx, "first");
+    cx.dispatch_action(End);
+    cx.dispatch_action(InsertNewline);
+    cx.simulate_input("second");
+    redraw(&mut cx);
+    editor.read_with(&cx, |editor, _| {
+        assert_eq!(editor.text(), "first\nsecond");
+        let layout = editor.layout.as_ref().expect("layout");
+        assert_eq!(
+            layout.lines().len(),
+            2,
+            "single newline must break visual line"
+        );
+    });
+}
+
+#[gpui::test]
+fn home_and_end_follow_soft_wrapped_visual_lines(cx: &mut TestAppContext) {
+    let words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma";
+    let (mut cx, editor) = editor_window(cx, words);
+    let line2_start = editor.read_with(&cx, |editor, _| {
+        let layout = editor.layout.as_ref().expect("layout");
+        assert!(layout.lines().len() >= 2, "expected paragraph to wrap");
+        layout.lines()[1].start as usize
+    });
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            let target = (line2_start + 3).min(words.len());
+            editor.set_selected_text_range(target..target, window, cx);
+        });
+    });
+    cx.dispatch_action(Home);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.caret()),
+        line2_start,
+        "Home must move to start of the current visual line, not line 0"
+    );
+    let line2_end = editor.read_with(&cx, |editor, _| {
+        editor.layout.as_ref().expect("layout").lines()[1].end as usize
+    });
+    cx.dispatch_action(End);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.caret()),
+        line2_end,
+        "End must stop at the end of the current visual line"
+    );
+}
+
+#[gpui::test]
+fn typewriter_mode_allows_half_viewport_bottom_overscroll(cx: &mut TestAppContext) {
+    let text = (0..40).map(|i| format!("line {i}\n")).collect::<String>();
+    let (mut cx, editor) = editor_window(cx, &text);
+    cx.dispatch_action(ToggleTypewriter);
+    cx.dispatch_action(DocEnd);
+    redraw(&mut cx);
+    let (scroll, total, viewport) = editor.read_with(&cx, |editor, _| {
+        let total = editor.layout.as_ref().expect("layout").total();
+        let viewport = editor.viewport().expect("viewport").1;
+        (editor.scroll, total, viewport)
+    });
+    let normal_max = (total - viewport).max(0.0);
+    assert!(
+        scroll > normal_max,
+        "typewriter end-of-doc scroll ({scroll}) should overscroll past normal max ({normal_max})"
+    );
+}
+
+#[gpui::test]
+fn selection_delimiter_wrapping_preserves_inner_selection(cx: &mut TestAppContext) {
+    let (mut cx, editor) = editor_window(cx, "hello world");
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_selected_text_range(6..11, window, cx);
+        });
+    });
+    cx.simulate_input("*");
+    editor.read_with(&cx, |editor, _| {
+        assert_eq!(editor.text(), "hello *world*");
+        assert_eq!(editor.selection(), Some(7..12));
+    });
+    cx.simulate_input("\"");
+    editor.read_with(&cx, |editor, _| {
+        assert_eq!(editor.text(), "hello *\"world\"*");
+        assert_eq!(editor.selection(), Some(8..13));
+    });
+}
+
+#[gpui::test]
+fn tab_and_shift_tab_indent_and_outdent_list_items(cx: &mut TestAppContext) {
+    let (mut cx, editor) = editor_window(cx, "- one\n- two");
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_selected_text_range(2..9, window, cx);
+        });
+    });
+    cx.dispatch_action(InsertTab);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "  - one\n  - two"
+    );
+    cx.dispatch_action(SwitchFindField);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "- one\n- two"
+    );
+    // Plain paragraph falls back to literal tab.
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.replace_document("plain prose", cx);
+            editor.set_selected_text_range(11..11, window, cx);
+        });
+    });
+    cx.dispatch_action(InsertTab);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "plain prose\t"
+    );
+}
+
+#[gpui::test]
+fn narrow_window_clamps_column_width_and_wide_keeps_desired(cx: &mut TestAppContext) {
+    cx.update(install_fonts);
+    cx.update(install_keybindings);
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(480.0), px(640.0)));
+    let window = cx
+        .update(|cx| {
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|cx| EditorView::new_light(cx, "hello world")),
+            )
+        })
+        .expect("open narrow editor window");
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let editor = window.root(&mut cx).expect("editor root");
+    redraw(&mut cx);
+    let narrow_col = editor.read_with(&cx, |editor, _| editor.layout_width);
+    assert!(
+        (240.0..460.0).contains(&narrow_col),
+        "narrow window should clamp column responsively, got {narrow_col}"
+    );
+}
+
+#[gpui::test]
+fn replace_document_undoable_restores_previous_text_on_undo(cx: &mut TestAppContext) {
+    let (mut cx, editor) = editor_window(cx, "current draft");
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.replace_document_undoable("older snapshot", window, cx);
+        });
+    });
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "older snapshot"
+    );
+    cx.dispatch_action(Undo);
+    assert_eq!(
+        editor.read_with(&cx, |editor, _| editor.text().to_owned()),
+        "current draft"
+    );
+}
+
+#[test]
+fn reading_highlights_merge_overlapping_spans_and_filter_external_links() {
+    let tokens = pilcrow_ui::theme::light();
+    let text = "bold link";
+    let spans = vec![pilcrow_core::display::DisplaySpan {
+        range: 0..9,
+        kind: InlineKind::Bold,
+    }];
+    let links = vec![pilcrow_core::display::DisplayLink {
+        range: 5..9,
+        url: "https://example.com".to_owned(),
+    }];
+    let parsed = crate::reading::build_reading_highlights(text, &spans, &links, &tokens);
+    assert_eq!(parsed.highlights.len(), 2);
+    assert_eq!(parsed.highlights[0].0, 0..5);
+    assert_eq!(parsed.highlights[1].0, 5..9);
+    assert_eq!(parsed.highlights[1].1.font_weight, Some(FontWeight::BOLD));
+    assert_eq!(parsed.highlights[1].1.color, Some(tokens.accent));
+    assert_eq!(parsed.click_ranges, vec![5..9]);
+    assert_eq!(parsed.click_urls, vec!["https://example.com"]);
+}
+
+#[test]
+fn adjust_spell_ranges_drops_edited_word_and_shifts_trailing_words() {
+    let mut spell = vec![0..3, 4..8, 12..16];
+    crate::adjust_spell_ranges(&mut spell, 5, 6, 8);
+    assert_eq!(spell, vec![0..3, 14..18]);
 }
